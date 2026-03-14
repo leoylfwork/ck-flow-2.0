@@ -1,3 +1,4 @@
+'use client';
 
 import React, { useState, useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from 'react';
 import { 
@@ -43,7 +44,6 @@ import {
   Download,
   ArrowLeft,
   Info,
-  MessageSquare,
   Car,
   Settings,
   RefreshCcw,
@@ -68,12 +68,27 @@ import {
   WorkType,
   STORED_STATUSES
 } from './types';
-import { getDiagnosticAdvice, decodeVIN, type DiagnosticContext } from './services/ai';
+import { getDiagnosticAdvice, decodeVIN, scanVinFromImage, type DiagnosticContext, type VinDecodedData } from './services/ai';
 import { useAuth } from './services/authContext';
-import { createRepairOrder, updateRepairOrder, addLogEntry, assignBay, getRepairOrders, getBays, type RepairOrderUpdate } from './services/supabase';
-import { supabase } from './services/supabaseClient';
 import { canAssignBay, canBroadcast, canChangePayment, canChangeStatus, canCreateOrder, canSeeActiveBays } from './services/capabilities';
 import { useCurrentUserRole } from './lib/hooks/useCurrentUserRole';
+import {
+  appendRepairOrder,
+  appendRepairOrderAiLog,
+  appendRepairOrderLog,
+  buildRepairOrderFieldLogs,
+  createRepairOrderLogEntry,
+  getAttachmentSource,
+  isRepairOrderArchived,
+  markRepairOrderAsRead,
+  moveRepairOrderToBay,
+  moveRepairOrderToSection,
+  releaseRepairOrderFromBay,
+  restoreArchivedRepairOrder,
+  settleRepairOrder,
+  syncCalendarEventsToRepairOrders,
+  updateRepairOrderRecord,
+} from './services/repairOrders';
 
 const INITIAL_ROS: RepairOrder[] = [
   {
@@ -104,7 +119,7 @@ const INITIAL_BAYS: Bay[] = [
   { id: 4, name: 'Bay 4', workType: 'MECHANIC' },
   { id: 5, name: 'Bay 5', workType: 'MECHANIC' },
   { id: 6, name: 'Oil Changer', workType: 'MECHANIC' },
-  { id: 7, name: 'Body Work', workType: 'BODY' },
+  { id: 7, name: 'Bodywork', workType: 'BODY' },
   { id: 8, name: 'Painting and Prep', workType: 'BODY' },
   { id: 9, name: 'Mechanic Shop To-do', workType: 'BODY' },
 ];
@@ -123,6 +138,55 @@ const formatMs = (ms: number) => {
   const m = Math.floor((ms % 3600000) / 60000);
   const s = Math.floor((ms % 60000) / 1000);
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
+
+const readFileAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+
+const buildLocalAttachment = async (file: File): Promise<Attachment> => ({
+  id: Math.random().toString(36).substr(2, 9),
+  name: file.name,
+  type: file.type,
+  sizeBytes: file.size,
+  previewUrl: await readFileAsDataUrl(file),
+});
+
+const hasDisplayValue = (value: unknown): boolean => {
+  if (value === null || value === undefined) return false;
+  const text = String(value).trim();
+  if (!text) return false;
+  const lowered = text.toLowerCase();
+  return lowered !== 'n/a' && lowered !== 'na' && lowered !== 'null' && lowered !== 'not applicable';
+};
+
+const toDisplaySpecs = (decodedData?: RepairOrder['decodedData']) => {
+  if (!decodedData) return [];
+  const compact = [
+    { label: 'YEAR', value: decodedData.year },
+    { label: 'MAKE', value: decodedData.make },
+    { label: 'MODEL', value: decodedData.model },
+    { label: 'ENGINE', value: decodedData.engine },
+    { label: 'TRIM', value: decodedData.trim },
+    { label: 'TRANSMISSION', value: decodedData.transmission },
+    { label: 'DRIVETRAIN', value: decodedData.drivetrain },
+    { label: 'BODY STYLE', value: decodedData.bodyStyle },
+    { label: 'PLANT', value: decodedData.plant },
+  ];
+  return compact.filter((s) => hasDisplayValue(s.value));
+};
+
+const toVehicleSummary = (decodedData?: RepairOrder['decodedData']) => {
+  if (!decodedData) return '';
+  if (hasDisplayValue(decodedData.summary)) return String(decodedData.summary);
+  const fallback = [decodedData.year, decodedData.make, decodedData.model, decodedData.bodyStyle]
+    .filter(hasDisplayValue)
+    .join(' ');
+  return fallback;
 };
 
 /** Assign cards to slots: explicit gridPosition first, then fill remaining in stable order. Prevents duplicate gridPosition from hiding cards. */
@@ -154,22 +218,22 @@ function assignCardsToSlots(sectionItems: RepairOrder[], gridCount: number): (Re
   return result;
 }
 
+function safeLocalStorageGet(key: string): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
   const auth = useAuth();
   const { role: currentUserRole, loading: roleLoading } = useCurrentUserRole();
-  const [workType, setWorkType] = useState<WorkType>(() => {
-    const saved = localStorage.getItem('ck_flow_work_type');
-    return (saved as WorkType) || 'MECHANIC';
-  });
+  const hasHydratedFromStorage = useRef(false);
+  const [workType, setWorkType] = useState<WorkType>('MECHANIC');
 
-  const [userRole, setUserRole] = useState<Role>(() => {
-    const saved = localStorage.getItem('ck_flow_role');
-    const initialRole = (saved as Role) || 'ADVISOR';
-    const savedWorkType = localStorage.getItem('ck_flow_work_type');
-    if (savedWorkType === 'BODY') return 'OWNER';
-    if (savedWorkType === 'MECHANIC' && initialRole === 'OWNER') return 'ADVISOR';
-    return initialRole;
-  });
+  const [userRole, setUserRole] = useState<Role>('ADVISOR');
 
   // Keep role aligned with authenticated role in mechanic mode.
   // Body shop is visible to all roles; no forced role switching there.
@@ -184,41 +248,16 @@ export default function App() {
     if (currentUserRole === 'owner' && userRole === 'OWNER') setUserRole('ADVISOR');
   }, [workType, currentUserRole, userRole]);
 
-  const [ros, setRos] = useState<RepairOrder[]>(() => {
-    const saved = localStorage.getItem('ck_flow_ros_v14');
-    const data = saved ? JSON.parse(saved) : INITIAL_ROS;
-    // Migration: Ensure all ROs have a workType
-    return data.map((ro: any) => ({
+  const [ros, setRos] = useState<RepairOrder[]>(() =>
+    INITIAL_ROS.map((ro: any) => ({
       ...ro,
       workType: ro.workType || 'MECHANIC',
       status: ro.status === ROStatus.INSURANCE ? ROStatus.BODY_WORK : ro.status,
       isInsuranceCase: ro.status === ROStatus.INSURANCE ? true : ro.isInsuranceCase,
-    }));
-  });
-  const [bays, setBays] = useState<Bay[]>(() => {
-    const saved = localStorage.getItem('ck_flow_bays_v14');
-    let data = saved ? JSON.parse(saved) : INITIAL_BAYS;
-    
-    // Migration: Ensure all bays from INITIAL_BAYS are present and have correct names
-    const existingIds = new Set(data.map((b: any) => b.id));
-    const missingBays = INITIAL_BAYS.filter(b => !existingIds.has(b.id));
-    if (missingBays.length > 0) {
-      data = [...data, ...missingBays];
-    }
-
-    // Sync names from INITIAL_BAYS for specific IDs
-    data = data.map((bay: any) => {
-      const initial = INITIAL_BAYS.find(ib => ib.id === bay.id);
-      if (initial) return { ...bay, name: initial.name, workType: initial.workType };
-      return bay;
-    });
-
-    return data;
-  });
-  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>(() => {
-    const saved = localStorage.getItem('ck_flow_calendar_v3');
-    return saved ? JSON.parse(saved) : [];
-  });
+    }))
+  );
+  const [bays, setBays] = useState<Bay[]>(() => INITIAL_BAYS);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   
   /** Sanitize saved column order: only stored statuses; INSURANCE→BODY_WORK; drop ARCHIVED/ORDER_LIST. */
   const sanitizeColumnOrder = (parsed: ROStatus[], defaultOrder: ROStatus[]): ROStatus[] => {
@@ -234,34 +273,15 @@ export default function App() {
     return deduped.length ? deduped : defaultOrder;
   };
 
-  const [advisorOrder, setAdvisorOrder] = useState<ROStatus[]>(() => {
-    const saved = localStorage.getItem('ck_flow_order_advisor_v5');
-    const parsed: ROStatus[] = saved ? JSON.parse(saved) : DEFAULT_ADVISOR_ORDER;
-    return sanitizeColumnOrder(parsed, DEFAULT_ADVISOR_ORDER);
-  });
+  const [advisorOrder, setAdvisorOrder] = useState<ROStatus[]>(DEFAULT_ADVISOR_ORDER);
   
-  const [foremanOrder, setForemanOrder] = useState<ROStatus[]>(() => {
-    const saved = localStorage.getItem('ck_flow_order_foreman_v5');
-    const parsed: ROStatus[] = saved ? JSON.parse(saved) : DEFAULT_FOREMAN_ORDER;
-    return sanitizeColumnOrder(parsed, DEFAULT_FOREMAN_ORDER);
-  });
+  const [foremanOrder, setForemanOrder] = useState<ROStatus[]>(DEFAULT_FOREMAN_ORDER);
 
-  const [ownerOrder, setOwnerOrder] = useState<ROStatus[]>(() => {
-    const saved = localStorage.getItem('ck_flow_order_owner_v5');
-    const parsed: ROStatus[] = saved ? JSON.parse(saved) : DEFAULT_OWNER_ORDER;
-    return sanitizeColumnOrder(parsed, DEFAULT_OWNER_ORDER);
-  });
+  const [ownerOrder, setOwnerOrder] = useState<ROStatus[]>(DEFAULT_OWNER_ORDER);
 
-  const [bodyShopOrder, setBodyShopOrder] = useState<ROStatus[]>(() => {
-    const saved = localStorage.getItem('ck_flow_order_body_v5');
-    const parsed: ROStatus[] = saved ? JSON.parse(saved) : DEFAULT_BODY_SHOP_ORDER;
-    return sanitizeColumnOrder(parsed, DEFAULT_BODY_SHOP_ORDER);
-  });
+  const [bodyShopOrder, setBodyShopOrder] = useState<ROStatus[]>(DEFAULT_BODY_SHOP_ORDER);
 
-  const [collapsedSections, setCollapsedSections] = useState<ROStatus[]>(() => {
-    const saved = localStorage.getItem('ck_flow_collapsed_v2');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [collapsedSections, setCollapsedSections] = useState<ROStatus[]>([]);
 
   const [selectedROId, setSelectedROId] = useState<string | null>(null);
   const [view, setView] = useState<'DASHBOARD' | 'ARCHIVE' | 'CALENDAR' | 'ALL'>('DASHBOARD');
@@ -274,7 +294,84 @@ export default function App() {
   const [showBroadcastInput, setShowBroadcastInput] = useState(false);
   const [showSentToast, setShowSentToast] = useState(false);
   const [showBroadcastError, setShowBroadcastError] = useState(false);
-  const broadcastChannelRef = useRef<ReturnType<NonNullable<typeof supabase>['channel']> | null>(null);
+  const [showMileagePromptForROId, setShowMileagePromptForROId] = useState<string | null>(null);
+  const [mileagePromptInput, setMileagePromptInput] = useState('');
+  const [mileagePromptError, setMileagePromptError] = useState('');
+
+  useEffect(() => {
+    const savedWorkType = safeLocalStorageGet('ck_flow_work_type');
+    const nextWorkType = (savedWorkType as WorkType) || 'MECHANIC';
+    const savedRole = safeLocalStorageGet('ck_flow_role');
+    const initialRole = (savedRole as Role) || 'ADVISOR';
+    const nextUserRole =
+      nextWorkType === 'BODY'
+        ? 'OWNER'
+        : nextWorkType === 'MECHANIC' && initialRole === 'OWNER'
+          ? 'ADVISOR'
+          : initialRole;
+
+    const savedRos = safeLocalStorageGet('ck_flow_ros_v14');
+    const nextRos = (savedRos ? JSON.parse(savedRos) : INITIAL_ROS).map((ro: any) => ({
+      ...ro,
+      workType: ro.workType || 'MECHANIC',
+      status: ro.status === ROStatus.INSURANCE ? ROStatus.BODY_WORK : ro.status,
+      isInsuranceCase: ro.status === ROStatus.INSURANCE ? true : ro.isInsuranceCase,
+    }));
+
+    const savedBays = safeLocalStorageGet('ck_flow_bays_v14');
+    let nextBays = savedBays ? JSON.parse(savedBays) : INITIAL_BAYS;
+
+    const existingIds = new Set(nextBays.map((b: any) => b.id));
+    const missingBays = INITIAL_BAYS.filter(b => !existingIds.has(b.id));
+    if (missingBays.length > 0) {
+      nextBays = [...nextBays, ...missingBays];
+    }
+
+    nextBays = nextBays.map((bay: any) => {
+      const initial = INITIAL_BAYS.find(ib => ib.id === bay.id);
+      if (initial) return { ...bay, name: initial.name, workType: initial.workType };
+      return bay;
+    });
+
+    const savedCalendarEvents = safeLocalStorageGet('ck_flow_calendar_v3');
+    const savedAdvisorOrder = safeLocalStorageGet('ck_flow_order_advisor_v5');
+    const savedForemanOrder = safeLocalStorageGet('ck_flow_order_foreman_v5');
+    const savedOwnerOrder = safeLocalStorageGet('ck_flow_order_owner_v5');
+    const savedBodyShopOrder = safeLocalStorageGet('ck_flow_order_body_v5');
+    const savedCollapsedSections = safeLocalStorageGet('ck_flow_collapsed_v2');
+
+    setWorkType(nextWorkType);
+    setUserRole(nextUserRole);
+    setRos(nextRos);
+    setBays(nextBays);
+    setCalendarEvents(savedCalendarEvents ? JSON.parse(savedCalendarEvents) : []);
+    setAdvisorOrder(
+      sanitizeColumnOrder(
+        savedAdvisorOrder ? JSON.parse(savedAdvisorOrder) : DEFAULT_ADVISOR_ORDER,
+        DEFAULT_ADVISOR_ORDER
+      )
+    );
+    setForemanOrder(
+      sanitizeColumnOrder(
+        savedForemanOrder ? JSON.parse(savedForemanOrder) : DEFAULT_FOREMAN_ORDER,
+        DEFAULT_FOREMAN_ORDER
+      )
+    );
+    setOwnerOrder(
+      sanitizeColumnOrder(
+        savedOwnerOrder ? JSON.parse(savedOwnerOrder) : DEFAULT_OWNER_ORDER,
+        DEFAULT_OWNER_ORDER
+      )
+    );
+    setBodyShopOrder(
+      sanitizeColumnOrder(
+        savedBodyShopOrder ? JSON.parse(savedBodyShopOrder) : DEFAULT_BODY_SHOP_ORDER,
+        DEFAULT_BODY_SHOP_ORDER
+      )
+    );
+    setCollapsedSections(savedCollapsedSections ? JSON.parse(savedCollapsedSections) : []);
+    hasHydratedFromStorage.current = true;
+  }, []);
 
   const canAccessAdvisorMode = currentUserRole === 'advisor' || currentUserRole === 'owner';
   const canAccessForemanMode = currentUserRole === 'foreman' || currentUserRole === 'owner';
@@ -285,77 +382,30 @@ export default function App() {
     return (['ADVISOR', 'FOREMAN', 'OWNER'] as Role[]).filter((r) => r !== userRole);
   };
 
-  /** Supabase Realtime broadcast: all clients receive Advisor messages. */
-  useEffect(() => {
-    const client = supabase;
-    if (!client) return;
-    const channel = client
-      .channel('ck-flow-broadcast')
-      .on('broadcast', { event: 'advisor_broadcast' }, ({ payload }: { payload?: { text?: string } }) => {
-        setBroadcastMessage(payload?.text ?? null);
-      })
-      .on('broadcast', { event: 'clear_broadcast' }, () => {
-        setBroadcastMessage(null);
-      })
-      .subscribe();
-    broadcastChannelRef.current = channel;
-    return () => {
-      client.removeChannel(channel);
-      broadcastChannelRef.current = null;
-    };
-  }, []);
-
   const sendBroadcast = (text: string) => {
     if (!canBroadcast(userRole)) {
       console.warn('[capabilities] sendBroadcast: not allowed for role', userRole);
       return;
     }
-    const channel = broadcastChannelRef.current;
-    if (!supabase || !channel) {
-      setShowBroadcastError(true);
-      setTimeout(() => setShowBroadcastError(false), 3000);
-      return;
-    }
-    channel.send({
-      type: 'broadcast',
-      event: 'advisor_broadcast',
-      payload: { text },
-    });
+    // Frontend-only broadcast: scoped to the current client.
+    setBroadcastMessage(text);
     setShowSentToast(true);
     setTimeout(() => setShowSentToast(false), 3000);
   };
 
   const clearBroadcast = () => {
-    const channel = broadcastChannelRef.current;
-    if (supabase && channel) {
-      channel.send({ type: 'broadcast', event: 'clear_broadcast', payload: {} });
-    }
     setBroadcastMessage(null);
   };
   const [isScanning, setIsScanning] = useState(false);
+  const [openProfileAfterScan, setOpenProfileAfterScan] = useState(false);
   const [draggedSection, setDraggedSection] = useState<ROStatus | null>(null);
   const [isMobileSearchVisible, setIsMobileSearchVisible] = useState(false);
   const mobileSearchInputRef = useRef<HTMLInputElement>(null);
   const createROInFlightRef = useRef(false);
-
-  const refetchRosAndBays = async () => {
-    if (!supabase) return;
-    const [freshRos, freshBays] = await Promise.all([
-      getRepairOrders([]),
-      getBays(INITIAL_BAYS),
-    ]);
-    setRos(prev => freshRos.map(fresh => {
-      const prevRO = prev.find(p => p.id === fresh.id);
-      return {
-        ...fresh,
-        lastReadInfo: prevRO?.lastReadInfo ?? { ADVISOR: '', FOREMAN: '', OWNER: '' },
-        unreadBy: prevRO?.unreadBy ?? [],
-      };
-    }));
-    setBays(freshBays.map(b => ({ ...b, currentROId: freshRos.find(r => r.bayId === b.id)?.id })));
-  };
+  const [, setRefreshTick] = useState(0);
 
   useEffect(() => {
+    if (!hasHydratedFromStorage.current) return;
     try {
       localStorage.setItem('ck_flow_ros_v14', JSON.stringify(ros));
       localStorage.setItem('ck_flow_bays_v14', JSON.stringify(bays));
@@ -377,53 +427,14 @@ export default function App() {
     }
   }, [ros, bays, calendarEvents, advisorOrder, foremanOrder, ownerOrder, bodyShopOrder, collapsedSections, userRole, workType]);
 
-  /** Initial load: sync ROS and bays from DB so new browser / cleared cache shows correct data. */
-  const initialRefetchDoneRef = useRef(false);
-  useEffect(() => {
-    if (!supabase || initialRefetchDoneRef.current) return;
-    initialRefetchDoneRef.current = true;
-    refetchRosAndBays();
-  }, [supabase]);
-
-  /** Supabase Realtime: subscribe to repair_orders so other clients' changes are reflected. */
-  const refetchRosAndBaysRef = useRef(refetchRosAndBays);
-  refetchRosAndBaysRef.current = refetchRosAndBays;
-  const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    const client = supabase;
-    if (!client) return;
-    const onRealtimeChange = () => {
-      if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
-      realtimeDebounceRef.current = setTimeout(() => {
-        realtimeDebounceRef.current = null;
-        refetchRosAndBaysRef.current();
-      }, 600);
-    };
-    const channel = client
-      .channel('ck-flow-repair-orders')
-      .on(
-        'postgres_changes',
-        { schema: 'public', table: 'repair_orders', event: '*' },
-        onRealtimeChange
-      )
-      .on(
-        'postgres_changes',
-        { schema: 'public', table: 'event_log', event: 'INSERT' },
-        onRealtimeChange
-      )
-      .subscribe();
-    return () => {
-      if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
-      client.removeChannel(channel);
-    };
-  }, [supabase]);
+  // Backend-backed sync and realtime updates have been removed from this
+  // frontend-only build. The current implementation relies on localStorage
+  // as the source of truth. Backend engineers can reintroduce a sync layer
+  // (REST/WebSocket) when wiring this UI to the NestJS + AWS stack.
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setRos(prev => prev.map(ro => {
-        if (ro.status === ROStatus.IN_PROGRESS && ro.lastEnteredBayAt) return { ...ro }; 
-        return ro;
-      }));
+      setRefreshTick((prev) => prev + 1);
     }, 1000);
     return () => clearInterval(timer);
   }, []);
@@ -433,66 +444,32 @@ export default function App() {
    */
   useEffect(() => {
     const performZeroTouchSync = () => {
-      const today = new Date().toDateString();
-      
-      setRos(prevRos => {
-        let changed = false;
-        let updatedRos = [...prevRos];
-
-        calendarEvents.forEach(event => {
-          const eventDate = new Date(event.start).toDateString();
-          
-          if (eventDate === today) {
-            const existingRO = updatedRos.find(r => r.calendarEventId === event.id);
-            
-            if (!existingRO) {
-              const newRO: RepairOrder = {
-                id: `CAL-${event.id.slice(0, 4).toUpperCase()}`,
-                model: event.title,
-                vin: 'CALENDAR_SYNC',
-                customerName: 'Schedule Entry',
-                phone: 'N/A',
-                info: event.description || 'Synced from Calendar',
-                status: ROStatus.TODO, // Defaults to TODO
-                urgent: false,
-                order: updatedRos.length,
-                lastReadInfo: { ADVISOR: '', FOREMAN: '', OWNER: '' },
-                totalTimeInBay: 0,
-                unreadBy: ['ADVISOR', 'FOREMAN', 'OWNER'],
-                logs: [{ 
-                  id: Math.random().toString(36).substr(2, 9), 
-                  timestamp: new Date().toISOString(), 
-                  user: 'SYSTEM', 
-                  text: 'Zero-Touch: Auto-synced from Calendar for today.', 
-                  type: 'SYSTEM' 
-                }],
-                aiChat: [],
-                calendarEventId: event.id,
-                workType: workType // Sycned to current module
-              };
-              updatedRos.push(newRO);
-              changed = true;
-            } else {
-              if (existingRO.model !== event.title || existingRO.info !== event.description) {
-                updatedRos = updatedRos.map(r => 
-                  r.calendarEventId === event.id 
-                    ? { ...r, model: event.title, info: event.description } 
-                    : r
-                );
-                changed = true;
-              }
-            }
-          }
-        });
-
-        return changed ? updatedRos : prevRos;
-      });
+      setRos((prevRos) => syncCalendarEventsToRepairOrders(prevRos, calendarEvents, workType));
     };
 
     performZeroTouchSync();
   }, [calendarEvents, workType]);
 
   const currentRO = useMemo(() => ros.find(r => r.id === selectedROId), [ros, selectedROId]);
+
+  useEffect(() => {
+    if (!selectedROId) {
+      setShowMileagePromptForROId(null);
+      return;
+    }
+    if (!currentRO || userRole !== 'FOREMAN') return;
+    const hasMileage = currentRO.mileage != null && currentRO.mileage > 0;
+    if (hasMileage) return;
+    const promptKey = `ck_flow_mileage_prompt_foreman_${currentRO.id}`;
+    try {
+      if (localStorage.getItem(promptKey)) return;
+    } catch (e) {
+      console.warn('Mileage prompt localStorage read failed', e);
+    }
+    setMileagePromptInput('');
+    setMileagePromptError('');
+    setShowMileagePromptForROId(currentRO.id);
+  }, [selectedROId, currentRO, userRole]);
 
   const toggleSection = (status: ROStatus) => {
     setCollapsedSections(prev => 
@@ -503,53 +480,13 @@ export default function App() {
   };
 
   const addLog = (roId: string, text: string, type: LogEntry['type'] = 'USER', imageUrl?: string) => {
-    if (supabase) {
-      addLogEntry(roId, { type, text, entry_type: 'activity', imageUrl })
-        .then(() => refetchRosAndBays())
-        .catch((e) => console.error('addLogEntry:', e));
-      return;
-    }
-    const newLog: LogEntry = {
-      id: Math.random().toString(36).substr(2, 9),
-      timestamp: new Date().toISOString(),
-      user: userRole,
-      text,
-      type,
-      imageUrl
-    };
-    setRos(prev => prev.map(ro => {
-      if (ro.id === roId) {
-        const targetRoles = getTargetRolesForNotification();
-        const newUnreadBy = [...new Set([...ro.unreadBy, ...targetRoles])];
-        return { ...ro, logs: [...ro.logs, newLog], unreadBy: newUnreadBy };
-      }
-      return ro;
-    }));
+    const newLog = createRepairOrderLogEntry(userRole, text, type, imageUrl);
+    setRos((prev) => appendRepairOrderLog(prev, roId, newLog, getTargetRolesForNotification()));
   };
 
   const addAiLog = (roId: string, text: string, type: LogEntry['type'] = 'USER', imageUrl?: string) => {
-    if (supabase) {
-      addLogEntry(roId, { type, text, entry_type: 'diagnostic', imageUrl })
-        .then(() => refetchRosAndBays())
-        .catch((e) => console.error('addLogEntry:', e));
-      return;
-    }
-    const newLog: LogEntry = {
-      id: Math.random().toString(36).substr(2, 9),
-      timestamp: new Date().toISOString(),
-      user: userRole,
-      text,
-      type,
-      imageUrl
-    };
-    setRos(prev => prev.map(ro => {
-      if (ro.id === roId) {
-        const targetRoles = getTargetRolesForNotification();
-        const newUnreadBy = [...new Set([...ro.unreadBy, ...targetRoles])];
-        return { ...ro, aiChat: [...(ro.aiChat || []), newLog], unreadBy: newUnreadBy };
-      }
-      return ro;
-    }));
+    const newLog = createRepairOrderLogEntry(userRole, text, type, imageUrl);
+    setRos((prev) => appendRepairOrderAiLog(prev, roId, newLog, getTargetRolesForNotification()));
   };
 
   const updateRO = (id: string, updates: Partial<RepairOrder>) => {
@@ -566,84 +503,33 @@ export default function App() {
       return;
     }
 
-    const fieldLogs: string[] = [];
-    if (updates.id !== undefined && updates.id !== ro.id) fieldLogs.push(`RO changed: ${ro.id} → ${updates.id}`);
-    if (updates.model !== undefined && updates.model !== ro.model) fieldLogs.push(`Model updated: ${updates.model}`);
-    if (updates.vin !== undefined && updates.vin !== ro.vin) fieldLogs.push(`VIN updated: ${updates.vin}`);
-    if (updates.customerName !== undefined && updates.customerName !== ro.customerName) fieldLogs.push(`Customer: ${updates.customerName}`);
-    if (updates.phone !== undefined && updates.phone !== ro.phone) fieldLogs.push(`Phone: ${updates.phone}`);
-    if (updates.urgent !== undefined && updates.urgent !== ro.urgent) fieldLogs.push(`Priority: ${updates.urgent ? 'URGENT' : 'NORMAL'}`);
-    if (updates.mileage !== undefined && updates.mileage !== ro.mileage) fieldLogs.push(`Odometer updated: ${updates.mileage} km`);
-    
+    const fieldLogs = buildRepairOrderFieldLogs(
+      ro,
+      updates,
+      (status) => getStatusLabels(workType)[status],
+    );
+
     if (updates.status !== undefined && updates.status !== ro.status) {
-        const currentLabels = getStatusLabels(workType);
-        fieldLogs.push(`Workflow updated: ${currentLabels[ro.status]} → ${currentLabels[updates.status]}`);
         if (ro.bayId !== undefined && updates.status !== ro.status) {
             leaveBay(id, updates.status);
             return;
         }
     }
 
-    const dbUpdates: RepairOrderUpdate = {};
-    if (updates.status !== undefined) dbUpdates.status = updates.status;
-    if (updates.paymentMethod !== undefined) dbUpdates.paymentMethod = updates.paymentMethod;
-    if (updates.paymentAmount !== undefined) dbUpdates.paymentAmount = updates.paymentAmount;
-    if (updates.settledAt !== undefined) dbUpdates.settledAt = updates.settledAt;
-    if (updates.model !== undefined) {
-      dbUpdates.model = updates.model;
-      if (updates.info === undefined) dbUpdates.info = ro.info;
-    }
-    if (updates.vin !== undefined) dbUpdates.vin = updates.vin;
-    if (updates.customerName !== undefined) dbUpdates.customerName = updates.customerName;
-    if (updates.phone !== undefined) dbUpdates.phone = updates.phone;
-    if (updates.info !== undefined) {
-      dbUpdates.info = updates.info;
-      if (dbUpdates.model === undefined) dbUpdates.model = ro.model;
-    }
-    if (updates.urgent !== undefined) dbUpdates.urgent = updates.urgent;
-    if (updates.mileage !== undefined) dbUpdates.mileage = updates.mileage;
-    if (updates.deliveryDate !== undefined) dbUpdates.deliveryDate = updates.deliveryDate;
-    if (updates.gridPosition !== undefined) dbUpdates.gridPosition = updates.gridPosition;
-    if (updates.calendarEventId !== undefined) dbUpdates.calendarEventId = updates.calendarEventId;
-    if (updates.isInsuranceCase !== undefined) dbUpdates.isInsuranceCase = updates.isInsuranceCase;
-    if (updates.isInsuranceCase !== undefined) dbUpdates.isInsuranceCase = updates.isInsuranceCase;
-
-    const targetRoles = getTargetRolesForNotification();
-    const applyState = () => {
-      setRos(prev => prev.map(item => {
-        if (item.id === id) {
-          if (updates.id && updates.id !== id) {
-            if (selectedROId === id) setSelectedROId(updates.id);
-          }
-          const newUnreadBy = [...new Set([...item.unreadBy, ...targetRoles])];
-          return { ...item, ...updates, unreadBy: newUnreadBy };
-        }
-        return item;
-      }));
-      fieldLogs.forEach(logText => addLog(updates.id || id, logText, 'SYSTEM'));
-    };
-
-    if (supabase && Object.keys(dbUpdates).length > 0) {
-      updateRepairOrder(id, dbUpdates)
-        .then(() => refetchRosAndBays())
-        .then(() => { fieldLogs.forEach(logText => addLog(updates.id || id, logText, 'SYSTEM')); })
-        .catch((e) => console.error('updateRepairOrder:', e));
-      return;
-    }
-    applyState();
+    const result = updateRepairOrderRecord(
+      ros,
+      id,
+      updates,
+      getTargetRolesForNotification(),
+      selectedROId,
+    );
+    setSelectedROId(result.nextSelectedROId);
+    setRos(result.repairOrders);
+    fieldLogs.forEach(logText => addLog(updates.id || id, logText, 'SYSTEM'));
   };
 
   const markAsRead = (id: string) => {
-    setRos(prev => prev.map(ro => {
-      if (ro.id === id) {
-        return { 
-          ...ro, 
-          unreadBy: ro.unreadBy.filter(r => r !== userRole),
-          lastReadInfo: { ...ro.lastReadInfo, [userRole]: ro.info }
-        };
-      }
-      return ro;
-    }));
+    setRos((prev) => markRepairOrderAsRead(prev, id, userRole));
   };
 
   const handleMoveToSection = (roId: string, status: ROStatus, gridPosition?: number) => {
@@ -659,46 +545,7 @@ export default function App() {
       return;
     }
 
-    const evictedId =
-      gridPosition !== undefined
-        ? ros.find(
-            (r) => r.id !== roId && r.status === status && r.gridPosition === gridPosition
-          )?.id
-        : undefined;
-
-    const applyOptimistic = () => {
-      setRos((prev) =>
-        prev.map((item) => {
-          if (item.id === roId) return { ...item, status, gridPosition };
-          if (item.id === evictedId && gridPosition !== undefined)
-            return { ...item, gridPosition: undefined };
-          return item;
-        })
-      );
-    };
-
-    if (supabase) {
-      applyOptimistic();
-      const payload: RepairOrderUpdate = { status };
-      if (gridPosition !== undefined) payload.gridPosition = gridPosition;
-      const promises: Promise<unknown>[] = [
-        updateRepairOrder(roId, payload),
-        ...(evictedId
-          ? [updateRepairOrder(evictedId, { gridPosition: undefined })]
-          : []),
-      ];
-      Promise.all(promises)
-        .then(() => refetchRosAndBays())
-        .then(() => {
-          if (status !== ro.status) {
-            const currentLabels = getStatusLabels(workType);
-            addLog(roId, `Workflow updated: ${currentLabels[ro.status]} → ${currentLabels[status]}`, 'SYSTEM');
-          }
-        })
-        .catch((e) => console.error('updateRepairOrder:', e));
-      return;
-    }
-    applyOptimistic();
+    setRos((prev) => moveRepairOrderToSection(prev, roId, status, gridPosition));
     if (status !== ro.status) {
       const currentLabels = getStatusLabels(workType);
       addLog(roId, `Workflow updated: ${currentLabels[ro.status]} → ${currentLabels[status]}`, 'SYSTEM');
@@ -726,38 +573,9 @@ export default function App() {
     const targetBay = bays.find(b => b.id === bayId);
     const ro = ros.find(r => r.id === roId);
     if (!ro) return;
-    let nextStatus = ro.status;
-    if (targetBay?.workType === 'MECHANIC') {
-      nextStatus = ROStatus.IN_PROGRESS;
-    } else if (targetBay?.workType === 'BODY') {
-      if (bayId === 7) nextStatus = ROStatus.BODY_WORK;
-      else if (bayId === 8) nextStatus = ROStatus.PAINTING;
-      else if (bayId === 9) nextStatus = ROStatus.MECHANIC_WORK;
-    }
-    const timeInPrevBay = ro.lastEnteredBayAt ? Date.now() - ro.lastEnteredBayAt : 0;
-    const newTotalMs = ro.totalTimeInBay + timeInPrevBay;
-    const now = Date.now();
-
-    if (supabase) {
-      Promise.all([
-        assignBay(roId, bayId, { totalTimeInBayMs: newTotalMs, lastEnteredBayAt: now }),
-        updateRepairOrder(roId, { status: nextStatus }),
-      ])
-        .then(() => refetchRosAndBays())
-        .then(() => addLog(roId, `Vehicle moved into ${targetBay?.name || `Bay ${bayId}`}`, 'SYSTEM'))
-        .catch((e) => console.error('moveToBay:', e));
-      return;
-    }
-    setRos(prev => prev.map(r => {
-      if (r.id === roId) {
-        return { ...r, status: nextStatus, bayId, lastEnteredBayAt: now, totalTimeInBay: newTotalMs, gridPosition: undefined };
-      }
-      return r;
-    }));
-    setBays(prev => prev.map(b => ({
-      ...b,
-      currentROId: b.id === bayId ? roId : (b.currentROId === roId ? undefined : b.currentROId)
-    })));
+    const next = moveRepairOrderToBay(ros, bays, roId, bayId);
+    setRos(next.repairOrders);
+    setBays(next.bays);
     addLog(roId, `Vehicle moved into ${targetBay?.name || `Bay ${bayId}`}`, 'SYSTEM');
   };
 
@@ -768,41 +586,67 @@ export default function App() {
     }
     const ro = ros.find(r => r.id === roId);
     if (!ro) return;
-    const timeSpent = ro.lastEnteredBayAt ? Date.now() - ro.lastEnteredBayAt : 0;
-    const sessionDurationStr = formatMs(timeSpent);
-    const totalLifetimeStr = formatMs(ro.totalTimeInBay + timeSpent);
-    const newTotalMs = ro.totalTimeInBay + timeSpent;
-
-    if (supabase) {
-      Promise.all([
-        assignBay(roId, null, { totalTimeInBayMs: newTotalMs }),
-        updateRepairOrder(roId, { status: nextStatus }),
-      ])
-        .then(() => refetchRosAndBays())
-        .then(() => addLog(roId, `Vehicle exited Bay. Session Time: ${sessionDurationStr} | Total Bay Time: ${totalLifetimeStr}`, 'SYSTEM'))
-        .catch((e) => console.error('leaveBay:', e));
-      return;
-    }
-    setRos(prev => prev.map(item => {
-      if (item.id === roId) return { ...item, status: nextStatus, bayId: undefined, lastEnteredBayAt: undefined, totalTimeInBay: newTotalMs };
-      return item;
-    }));
-    setBays(prev => prev.map(b => ({ ...b, currentROId: b.currentROId === roId ? undefined : b.currentROId })));
+    const next = releaseRepairOrderFromBay(ros, bays, roId, nextStatus);
+    const sessionDurationStr = formatMs(next.sessionDurationMs);
+    const totalLifetimeStr = formatMs(next.totalDurationMs);
+    setRos(next.repairOrders);
+    setBays(next.bays);
     addLog(roId, `Vehicle exited Bay. Session Time: ${sessionDurationStr} | Total Bay Time: ${totalLifetimeStr}`, 'SYSTEM');
   };
 
   const handleResolveConflict = (resolution: ROStatus) => {
     if (!showBayConflictDialog) return;
+    if (!canAssignBay(userRole)) {
+      console.warn('[capabilities] handleResolveConflict: not allowed for role', userRole);
+      return;
+    }
+
     const { newROId, bayId } = showBayConflictDialog;
-    const oldROId = bays.find(b => b.id === bayId)?.currentROId;
-    if (oldROId) leaveBay(oldROId, resolution);
-    moveToBay(newROId, bayId);
+    const targetBay = bays.find(b => b.id === bayId);
+    const oldROId = targetBay?.currentROId;
+
+    // If bay somehow became free, just move the new RO in.
+    if (!oldROId) {
+      moveToBay(newROId, bayId);
+      setShowBayConflictDialog(null);
+      return;
+    }
+
+    // 1) Release existing RO from bay and update its status (DONE / PENDING)
+    const released = releaseRepairOrderFromBay(ros, bays, oldROId, resolution);
+    const sessionDurationStr = formatMs(released.sessionDurationMs);
+    const totalLifetimeStr = formatMs(released.totalDurationMs);
+
+    // 2) Move the new RO into the same bay, based on the updated collections
+    const moved = moveRepairOrderToBay(
+      released.repairOrders,
+      released.bays,
+      newROId,
+      bayId
+    );
+
+    setRos(moved.repairOrders);
+    setBays(moved.bays);
+
+    addLog(
+      oldROId,
+      `Vehicle exited Bay. Session Time: ${sessionDurationStr} | Total Bay Time: ${totalLifetimeStr}`,
+      'SYSTEM'
+    );
+    addLog(
+      newROId,
+      `Vehicle moved into ${targetBay?.name || `Bay ${bayId}`}`,
+      'SYSTEM'
+    );
+
     setShowBayConflictDialog(null);
   };
 
-  // Filter ROs based on the selected WorkType (MECHANIC vs BODY)
+  // Filter ROs based on the selected WorkType (MECHANIC vs BODY); exclude archived so they only appear in History.
   const filteredROs = useMemo(() => {
-    const filteredByModule = ros.filter(ro => ro.workType === workType);
+    const filteredByModule = ros.filter(
+      ro => ro.workType === workType && !isRepairOrderArchived(ro)
+    );
     const q = searchQuery.toLowerCase().trim();
     if (!q) return filteredByModule;
     const qRaw = q.replace(/\D/g, '');
@@ -857,12 +701,7 @@ export default function App() {
 
   const handleNoRepair = (id: string) => {
     addLog(id, `Settle: NO REPAIR (Abandoned)`, 'SYSTEM');
-    updateRO(id, { 
-      status: ROStatus.ARCHIVED, 
-      paymentMethod: 'ABANDONED', 
-      paymentAmount: 0, 
-      settledAt: new Date().toISOString() 
-    }); 
+    updateRO(id, settleRepairOrder({}, 'ABANDONED', 0)); 
     setSelectedROId(null);
   }
 
@@ -1045,11 +884,11 @@ export default function App() {
             </div>
           )}
 
-          {auth?.user?.email && (
+          {auth?.user && (
             <div className="flex items-center gap-2 shrink-0">
-              <span className="hidden sm:flex items-center gap-1.5 text-slate-500 text-[10px] font-bold max-w-[140px] lg:max-w-[180px] truncate" title={auth.user.email}>
+              <span className="hidden sm:flex items-center gap-1.5 text-slate-500 text-[10px] font-bold max-w-[140px] lg:max-w-[180px] truncate">
                 <Mail size={12} className="text-slate-400 shrink-0" />
-                <span className="truncate">{auth.user.email}</span>
+                <span className="truncate">Signed in</span>
               </span>
               <button
                 type="button"
@@ -1147,7 +986,7 @@ export default function App() {
               {currentSectionOrder.map((status) => {
                 const sectionItems = filteredROs.filter(ro => ro.status === status);
                 const isCollapsed = collapsedSections.includes(status);
-                const gridCount = Math.max(8, Math.ceil(sectionItems.length / 8) * 8);
+                const gridCount = Math.max(sectionItems.length, 1);
                 const slotAssignments = assignCardsToSlots(sectionItems, gridCount);
 
                 return (
@@ -1195,28 +1034,29 @@ export default function App() {
                             <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">No units in this status</p>
                           </div>
                         ) : (
-                          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 2xl:grid-cols-10 gap-3 content-start auto-rows-max">
-                            {slotAssignments.map((roInSlot, idx) => (
-                              <div 
-                                key={roInSlot ? roInSlot.id : `empty-${status}-${idx}`} 
-                                className={`relative min-h-[60px] md:aspect-square rounded border transition-colors overflow-hidden ${!roInSlot ? 'hidden md:block border-transparent bg-transparent' : 'border-transparent'}`} 
-                                onDragOver={(e) => e.preventDefault()} 
-                                onDrop={(e) => {
-                                  const roId = e.dataTransfer.getData('roId');
-                                  if (roId) { e.stopPropagation(); handleMoveToSection(roId, status, idx); }
-                                }}
-                              >
-                                {roInSlot && (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3 content-start auto-rows-max">
+                            {slotAssignments
+                              .map((roInSlot, idx) => ({ roInSlot, idx }))
+                              .filter(({ roInSlot }) => !!roInSlot)
+                              .map(({ roInSlot, idx }) => (
+                                <div 
+                                  key={roInSlot!.id}
+                                  className="relative min-h-[60px] md:aspect-square rounded border transition-colors overflow-hidden border-transparent"
+                                  onDragOver={(e) => e.preventDefault()} 
+                                  onDrop={(e) => {
+                                    const roId = e.dataTransfer.getData('roId');
+                                    if (roId) { e.stopPropagation(); handleMoveToSection(roId, status, idx); }
+                                  }}
+                                >
                                   <KanbanCard 
-                                      ro={roInSlot} 
+                                      ro={roInSlot!} 
                                       userRole={userRole} 
                                       userWorkType={workType}
-                                      onClick={() => { setSelectedROId(roInSlot.id); markAsRead(roInSlot.id); }} 
+                                      onClick={() => { setSelectedROId(roInSlot!.id); markAsRead(roInSlot!.id); }} 
                                       inInsuranceSection={status === ROStatus.BODY_WORK}
                                   />
-                                )}
-                              </div>
-                            ))}
+                                </div>
+                              ))}
                         </div>
                         )}
                       </div>
@@ -1320,9 +1160,9 @@ export default function App() {
         ) : view === 'ARCHIVE' ? (
           <OrderHistoryView 
             workType={workType}
-            ros={ros.filter(r => r.status === ROStatus.ARCHIVED && r.workType === workType)} 
+            ros={ros.filter((r) => isRepairOrderArchived(r) && r.workType === workType)} 
             onRestore={(id: string) => {
-                updateRO(id, { status: ROStatus.TODO, paymentMethod: undefined, paymentAmount: undefined, settledAt: undefined });
+                updateRO(id, restoreArchivedRepairOrder());
                 addLog(id, "Vehicle restored to workflow from History.", "SYSTEM");
             }} 
             onView={(id: string) => {
@@ -1355,14 +1195,14 @@ export default function App() {
 
       {showBayConflictDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
-          <div className="bg-white border border-slate-200 rounded p-8 max-sm w-full shadow-2xl animate-in zoom-in duration-200 text-center">
+          <div className="bg-white border border-slate-200 rounded-xl p-6 md:p-8 w-full max-w-sm shadow-2xl animate-in zoom-in duration-200 text-center">
             <h3 className="text-xl font-black mb-4 flex items-center justify-center gap-3 uppercase text-amber-600 tracking-tighter"><AlertTriangle size={24} /> BAY CONFLICT</h3>
             <p className="text-[10px] font-black text-slate-500 mb-8 uppercase tracking-widest">
               {bays.find(b => b.id === showBayConflictDialog.bayId)?.name || `Bay ${showBayConflictDialog.bayId}`} is occupied. Update current vehicle status:
             </p>
             <div className="space-y-3">
               <button onClick={() => handleResolveConflict(ROStatus.DONE)} className="w-full py-4 rounded bg-emerald-600 text-white font-black text-xs uppercase tracking-widest border-b-4 border-emerald-800 active:border-b-0">MARK AS DONE</button>
-              <button onClick={() => handleResolveConflict(ROStatus.PENDING)} className="w-full py-4 rounded border border-slate-200 bg-slate-50 text-slate-700 font-black text-xs uppercase tracking-widest">PENDING AREA</button>
+              <button onClick={() => handleResolveConflict(ROStatus.PENDING)} className="w-full py-4 rounded border border-slate-200 bg-slate-50 text-slate-700 font-black text-xs uppercase tracking-widest">Mark AS PENDING</button>
               <button onClick={() => setShowBayConflictDialog(null)} className="w-full py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest mt-4">CANCEL</button>
             </div>
           </div>
@@ -1380,20 +1220,144 @@ export default function App() {
           onAddAiLog={(text: string, type: any, img: any) => addAiLog(currentRO.id, text, type, img)}
           onShowPayment={() => setShowPaymentDialog(currentRO.id)} 
           onNoRepair={() => handleNoRepair(currentRO.id)}
-          onScan={() => setIsScanning(true)}
+          onScan={() => { setOpenProfileAfterScan(false); setIsScanning(true); }}
+          openProfileOnOpen={openProfileAfterScan}
+          onProfileOpened={() => setOpenProfileAfterScan(false)}
           getHeaderColor={getHeaderColor}
-          preventClose={!!showPaymentDialog}
+          preventClose={!!showPaymentDialog || isScanning || !!showMileagePromptForROId}
         />
       )}
 
-      {isScanning && ( <VINScanner onClose={() => setIsScanning(false)} onScan={(vin) => { if (currentRO) updateRO(currentRO.id, { vin }); setIsScanning(false); }} /> )}
+      {showMileagePromptForROId && (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div onMouseDown={(e) => e.stopPropagation()} className="bg-white border border-slate-200 rounded-xl shadow-xl w-full max-w-sm p-6 animate-in zoom-in-95 duration-200">
+            <h3 className="text-sm font-black text-slate-900 uppercase tracking-tight">Enter Odometer</h3>
+            <p className="mt-1 text-[11px] font-bold text-slate-500">Please input the mileage for this card before continuing.</p>
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={mileagePromptInput}
+              onChange={(e) => {
+                setMileagePromptInput(e.target.value);
+                if (mileagePromptError) setMileagePromptError('');
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                const roId = showMileagePromptForROId;
+                const mileageValue = Number(mileagePromptInput.trim());
+                if (!Number.isFinite(mileageValue) || mileageValue < 0) {
+                  setMileagePromptError('Please enter a valid mileage (0 or more).');
+                  return;
+                }
+                updateRO(roId, { mileage: Math.floor(mileageValue) });
+                try {
+                  localStorage.setItem(`ck_flow_mileage_prompt_foreman_${roId}`, '1');
+                } catch (err) {
+                  console.warn('Mileage prompt localStorage write failed', err);
+                }
+                setShowMileagePromptForROId(null);
+                setMileagePromptInput('');
+                setMileagePromptError('');
+              }}
+              placeholder="Kilometers (km)"
+              className="w-full mt-4 bg-slate-50 border border-slate-200 rounded-lg px-4 py-3 text-sm font-bold text-slate-900 outline-none focus:border-blue-600"
+              autoFocus
+            />
+            {mileagePromptError && (
+              <p className="mt-2 text-[10px] font-black text-red-600 uppercase tracking-wide">{mileagePromptError}</p>
+            )}
+            <div className="flex gap-3 mt-4">
+              <button
+                type="button"
+                onClick={() => {
+                  const roId = showMileagePromptForROId;
+                  try {
+                    localStorage.setItem(`ck_flow_mileage_prompt_foreman_${roId}`, '1');
+                  } catch (err) {
+                    console.warn('Mileage prompt localStorage write failed', err);
+                  }
+                  setShowMileagePromptForROId(null);
+                  setMileagePromptInput('');
+                  setMileagePromptError('');
+                }}
+                className="flex-1 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest border border-slate-200 text-slate-600 hover:bg-slate-50"
+              >
+                Do it later
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const roId = showMileagePromptForROId;
+                  const mileageValue = Number(mileagePromptInput.trim());
+                  if (!Number.isFinite(mileageValue) || mileageValue < 0) {
+                    setMileagePromptError('Please enter a valid mileage (0 or more).');
+                    return;
+                  }
+                  updateRO(roId, { mileage: Math.floor(mileageValue) });
+                  try {
+                    localStorage.setItem(`ck_flow_mileage_prompt_foreman_${roId}`, '1');
+                  } catch (err) {
+                    console.warn('Mileage prompt localStorage write failed', err);
+                  }
+                  setShowMileagePromptForROId(null);
+                  setMileagePromptInput('');
+                  setMileagePromptError('');
+                }}
+                className="flex-1 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest bg-slate-900 text-white hover:bg-slate-800"
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isScanning && (
+        <VINScanner
+          onBack={() => { setIsScanning(false); setOpenProfileAfterScan(true); }}
+          onScan={async ({ vin, attachment }) => {
+            if (currentRO) {
+              const nextAttachments = attachment
+                ? [...(currentRO.attachments || []), attachment]
+                : currentRO.attachments;
+              const updates: Partial<RepairOrder> = {};
+              if (vin) updates.vin = vin;
+              if (attachment) updates.attachments = nextAttachments;
+              if (vin) {
+                try {
+                  const decoded = await decodeVIN(vin);
+                  if (decoded) {
+                    updates.decodedData = {
+                      ...decoded,
+                      decodedAt: new Date().toISOString(),
+                    };
+                  }
+                } catch (error) {
+                  console.error('Auto VIN decode failed:', error);
+                }
+              }
+              if (Object.keys(updates).length > 0) {
+                updateRO(currentRO.id, updates);
+              }
+              if (attachment) {
+                addLog(currentRO.id, 'VIN scan snapshot captured.', 'SYSTEM', getAttachmentSource(attachment));
+              }
+              if (vin) {
+                addLog(currentRO.id, `VIN scanned from camera: ${vin}`, 'SYSTEM');
+              } else if (attachment) {
+                addLog(currentRO.id, 'VIN not detected from scan image. Snapshot saved for manual review.', 'SYSTEM');
+              }
+            }
+            setOpenProfileAfterScan(true);
+            setIsScanning(false);
+          }}
+        />
+      )}
 
       {showNewRODialog && ( <NewRODialog onClose={() => setShowNewRODialog(false)} onSubmit={(data) => {
             if (createROInFlightRef.current) return;
-            if (supabase && !canCreateOrder(userRole)) {
-              console.warn('[capabilities] createRepairOrder: not allowed for role', userRole);
-              return;
-            }
             const newROId = `RO-${Math.floor(1000 + Math.random() * 9000)}`;
             const infoPoints = (data.info || '').split('\n').filter(Boolean);
             const initialLogs: LogEntry[] = [
@@ -1420,28 +1384,15 @@ export default function App() {
               mileage: data.mileage ?? 0
             };
 
-            setRos(prev => [...prev, newRO]);
+            setRos((prev) => appendRepairOrder(prev, newRO));
             setShowNewRODialog(false);
-
-            if (supabase) {
-              createROInFlightRef.current = true;
-              createRepairOrder(newRO)
-                .then(() => refetchRosAndBays())
-                .catch((e) => console.error('createRepairOrder:', e))
-                .finally(() => { createROInFlightRef.current = false; });
-            }
           }} /> )}
 
-      {showPaymentDialog && ( <PaymentDialog roId={showPaymentDialog} onClose={() => setShowPaymentDialog(null)} onSettle={(method: any, amount: any) => { 
-            addLog(showPaymentDialog, `Payment Processed: ${method} ($${amount})`, 'SYSTEM');
-            updateRO(showPaymentDialog, { 
-              status: ROStatus.ARCHIVED, 
-              paymentMethod: method, 
-              paymentAmount: amount, 
-              settledAt: new Date().toISOString() 
-            }); 
-            setShowPaymentDialog(null); 
-            setSelectedROId(null); 
+	      {showPaymentDialog && ( <PaymentDialog roId={showPaymentDialog} onClose={() => setShowPaymentDialog(null)} onSettle={(method: any, amount: any) => { 
+	            addLog(showPaymentDialog, `Payment Processed: ${method} ($${amount})`, 'SYSTEM');
+	            updateRO(showPaymentDialog, settleRepairOrder({}, method, amount)); 
+	            setShowPaymentDialog(null); 
+	            setSelectedROId(null); 
           }} /> )}
     </div>
   );
@@ -1461,7 +1412,6 @@ function getStatusLabels(workType: WorkType) {
 function KanbanCard({ ro, userRole, onClick, inInsuranceSection, userWorkType }: { ro: RepairOrder, userRole: Role, onClick: () => void, inInsuranceSection?: boolean, userWorkType: WorkType }) {
   const isUnread = ro.unreadBy.includes(userRole);
   const currentLines = ro.info.split('\n').filter(p => p.trim());
-  const lastReadLines = (ro.lastReadInfo[userRole] || '').split('\n').filter(p => p.trim());
 
   const getStatusBorderColor = (s: ROStatus) => {
     switch(s) {
@@ -1506,15 +1456,14 @@ function KanbanCard({ ro, userRole, onClick, inInsuranceSection, userWorkType }:
       </div>
 
       <div className="flex-1 space-y-1 md:space-y-1.5 overflow-hidden pr-1">
-        {currentLines.map((p, i) => {
-          const isLineUnread = !lastReadLines.includes(p);
-          return (
-            <div key={i} className={`flex items-center gap-2 p-1 rounded transition-colors ${isLineUnread ? 'bg-amber-50 border border-amber-100' : ''}`}>
-              <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${isLineUnread ? 'bg-amber-600' : 'bg-slate-900'}`} />
-              <p className={`text-[10px] md:text-[11px] font-bold leading-tight ${isLineUnread ? 'text-amber-900' : 'text-slate-900'}`}>{p}</p>
-            </div>
-          );
-        })}
+        {currentLines.map((p, i) => (
+          <div key={i} className="flex items-center gap-2 p-1 rounded transition-colors min-w-0">
+            <div className="w-1.5 h-1.5 rounded-full shrink-0 bg-slate-900" />
+            <p className="text-[10px] md:text-[11px] font-bold leading-tight text-slate-900 break-words whitespace-normal min-w-0">
+              {p}
+            </p>
+          </div>
+        ))}
       </div>
       
       <div className="mt-1 md:mt-2 flex items-center justify-between">
@@ -1522,7 +1471,7 @@ function KanbanCard({ ro, userRole, onClick, inInsuranceSection, userWorkType }:
           {ro.calendarEventId && (
             <span className="text-[7px] font-black text-purple-700 uppercase tracking-widest bg-purple-100 px-1.5 py-0.5 rounded w-fit">CAL-SYNC</span>
           )}
-          {userWorkType === 'BODY' && ro.deliveryDate && (
+          {ro.deliveryDate && (
             <div className="flex items-center gap-1 text-[8px] font-black text-blue-700 uppercase tracking-tight bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100 w-fit">
               <Clock size={10} /> {ro.deliveryDate}
             </div>
@@ -1541,6 +1490,13 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
   const [currentDate, setCurrentDate] = useState(new Date());
   const [viewType, setViewType] = useState<'DAY' | 'WEEK' | 'MONTH'>('MONTH');
   const [showEventModal, setShowEventModal] = useState<Partial<CalendarEvent> | null>(null);
+  const isGoogleEvent = (event: CalendarEvent) => event.source === 'google';
+  const eventItemClass = (event: CalendarEvent) =>
+    isGoogleEvent(event)
+      ? 'bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100 hover:border-purple-300'
+      : 'bg-blue-50 border-blue-100 text-blue-700 hover:bg-blue-100 hover:border-blue-300';
+  const eventDotClass = (event: CalendarEvent) => (isGoogleEvent(event) ? 'bg-purple-600' : 'bg-blue-600');
+  const eventBorderClass = (event: CalendarEvent) => (isGoogleEvent(event) ? 'bg-purple-50 border-purple-600 text-purple-700 hover:bg-purple-100' : 'bg-blue-50 border-blue-600 text-blue-700 hover:bg-blue-100');
 
   const startOfMonth = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1);
   const endOfMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0);
@@ -1614,9 +1570,11 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
                         <div 
                           key={event.id}
                           onClick={(e) => { e.stopPropagation(); setShowEventModal(event); }}
-                          className="p-1.5 bg-blue-50 border border-blue-100 rounded-sm text-[9px] font-black text-blue-700 uppercase tracking-tight truncate cursor-pointer hover:bg-blue-100 hover:border-blue-300 transition-all flex items-center gap-1.5"
+                          className={`p-1.5 border rounded-sm text-[9px] font-black uppercase tracking-tight truncate cursor-pointer transition-all flex items-center gap-1.5 ${eventItemClass(event)}`}
                         >
-                          <div className="w-1 h-1 bg-blue-600 rounded-full shrink-0" /> {event.title}
+                          <div className={`w-1 h-1 rounded-full shrink-0 ${eventDotClass(event)}`} />
+                          {isGoogleEvent(event) && <span className="text-[8px] tracking-widest">G</span>}
+                          {event.title}
                         </div>
                       ))}
                     </div>
@@ -1665,9 +1623,12 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
                     <div 
                       key={event.id}
                       onClick={(e) => { e.stopPropagation(); setShowEventModal(event); }}
-                      className="absolute inset-x-1 top-2 p-2 bg-blue-50 border-l-4 border-blue-600 shadow-sm rounded-sm text-[10px] font-black text-blue-700 uppercase cursor-pointer hover:bg-blue-100 transition-all z-10"
+                      className={`absolute inset-x-1 top-2 p-2 border-l-4 shadow-sm rounded-sm text-[10px] font-black uppercase cursor-pointer transition-all z-10 ${eventBorderClass(event)}`}
                     >
-                      {event.title}
+                      <div className="flex items-center gap-1">
+                        {isGoogleEvent(event) && <span className="text-[8px] tracking-widest">GOOGLE</span>}
+                        <span>{event.title}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -1701,13 +1662,13 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
                       <div 
                         key={event.id}
                         onClick={(e) => { e.stopPropagation(); setShowEventModal(event); }}
-                        className="w-full p-4 bg-blue-50 border-l-8 border-blue-600 shadow-md rounded-md text-[11px] font-black text-blue-900 uppercase tracking-wide cursor-pointer hover:bg-blue-100 transition-all flex items-center justify-between"
+                        className={`w-full p-4 border-l-8 shadow-md rounded-md text-[11px] font-black uppercase tracking-wide cursor-pointer transition-all flex items-center justify-between ${eventBorderClass(event)} ${isGoogleEvent(event) ? 'text-purple-900' : 'text-blue-900'}`}
                       >
                         <div className="flex items-center gap-4">
-                           <Clock3 size={18} className="text-blue-500" />
+                           <Clock3 size={18} className={isGoogleEvent(event) ? 'text-purple-500' : 'text-blue-500'} />
                            <div>
                              <p>{event.title}</p>
-                             <p className="text-[9px] text-blue-400 mt-1 font-bold">{event.description.split('\n')[0] || 'No additional details'}</p>
+                             <p className={`text-[9px] mt-1 font-bold ${isGoogleEvent(event) ? 'text-purple-400' : 'text-blue-400'}`}>{event.description.split('\n')[0] || 'No additional details'}</p>
                            </div>
                         </div>
                         <ChevronRight size={18} className="text-blue-200" />
@@ -1751,10 +1712,11 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
 
           <div className="flex items-center gap-3">
             <button 
-              onClick={() => setShowEventModal({ start: new Date().toISOString(), end: new Date().toISOString() })}
+              type="button"
               className="bg-slate-900 text-white px-6 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 shadow-lg transition-all flex items-center gap-2 border-b-4 border-slate-700 active:border-b-0"
+              title="Sync with Google Calendar (coming soon)"
             >
-              <Plus size={16} /> New Event
+              <RefreshCcw size={16} /> Sync Google Calendar
             </button>
           </div>
         </div>
@@ -1768,7 +1730,7 @@ function CalendarView({ events, onAddEvent, onUpdateEvent, onDeleteEvent }: { ev
           onClose={() => setShowEventModal(null)}
           onSave={(e) => {
             if (e.id) onUpdateEvent(e);
-            else onAddEvent({ ...e, id: Math.random().toString(36).substr(2, 9) });
+            else onAddEvent({ ...e, id: Math.random().toString(36).substr(2, 9), source: e.source || 'manual' });
             setShowEventModal(null);
           }}
           onDelete={(id) => {
@@ -1792,6 +1754,7 @@ function CalendarEventModal({ event, onClose, onSave, onDelete }: { event: Parti
     title: event.title || '',
     description: event.description || '',
     start: getInitialDateString(),
+    source: event.source || 'manual',
   });
 
   return (
@@ -1832,8 +1795,19 @@ function CalendarEventModal({ event, onClose, onSave, onDelete }: { event: Parti
                 onChange={(e) => setFormData({...formData, start: e.target.value})}
               />
               <p className="text-[8px] font-bold text-blue-500 uppercase tracking-widest mt-2 flex items-center gap-1">
-                <Zap size={10} /> Auto-Syncs to Body Work on this date
+                <Zap size={10} /> Auto-Syncs to Bodywork on this date
               </p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">EVENT SOURCE</label>
+              <select
+                className="w-full bg-slate-50 border border-slate-200 rounded-lg p-4 text-xs font-black text-slate-900 outline-none focus:border-blue-600 shadow-inner uppercase tracking-wider"
+                value={formData.source}
+                onChange={(e) => setFormData({ ...formData, source: e.target.value as 'manual' | 'google' })}
+              >
+                <option value="manual">Manual</option>
+                <option value="google">Google Calendar</option>
+              </select>
             </div>
           </div>
 
@@ -1857,7 +1831,8 @@ function CalendarEventModal({ event, onClose, onSave, onDelete }: { event: Parti
                   title: formData.title, 
                   description: formData.description, 
                   start: localDateObj.toISOString(), 
-                  end: localDateObj.toISOString() 
+                  end: localDateObj.toISOString(),
+                  source: formData.source,
                 })
               }} 
               className="flex-1 bg-slate-900 text-white py-5 rounded-lg font-black uppercase text-xs tracking-widest shadow-xl border-b-4 border-slate-700 active:border-b-0 hover:bg-slate-800 transition-all"
@@ -1872,6 +1847,7 @@ function CalendarEventModal({ event, onClose, onSave, onDelete }: { event: Parti
 }
 
 function FilePreviewModal({ attachment, onClose }: { attachment: Attachment, onClose: () => void }) {
+  const attachmentSrc = getAttachmentSource(attachment);
   const isPdf = attachment.type === 'application/pdf';
   const isImage = attachment.type.startsWith('image/');
 
@@ -1883,15 +1859,15 @@ function FilePreviewModal({ attachment, onClose }: { attachment: Attachment, onC
             <div className="p-2 bg-slate-50 rounded text-blue-600">
               {isPdf ? <FileText size={20} /> : <ImageIcon size={20} />}
             </div>
-            <div>
-              <h3 className="text-sm font-black text-slate-900 uppercase tracking-tight">{attachment.name}</h3>
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <h3 className="text-sm font-black text-slate-900 uppercase tracking-tight break-words">{attachment.name}</h3>
               <p className="text-[10px] font-bold text-slate-400 uppercase">{attachment.type}</p>
             </div>
           </div>
           <div className="flex items-center gap-4">
-            {attachment.data && (
+            {attachmentSrc && (
               <a 
-                href={attachment.data} 
+                href={attachmentSrc} 
                 download={attachment.name}
                 className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-slate-200 transition-all"
               >
@@ -1909,13 +1885,13 @@ function FilePreviewModal({ attachment, onClose }: { attachment: Attachment, onC
         <div className="flex-1 bg-slate-100 overflow-hidden relative flex items-center justify-center">
           {isPdf ? (
             <embed 
-              src={attachment.data} 
+              src={attachmentSrc} 
               type="application/pdf" 
               className="w-full h-full"
             />
           ) : isImage ? (
             <img 
-              src={attachment.data} 
+              src={attachmentSrc} 
               alt={attachment.name} 
               className="max-w-full max-h-full object-contain p-8 drop-shadow-2xl"
             />
@@ -1942,6 +1918,13 @@ function DetailModalWrapper(props: any) {
   const modelInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (props.openProfileOnOpen) {
+      setShowInfoMobile(true);
+      props.onProfileOpened?.();
+    }
+  }, [props.openProfileOnOpen]);
+
+  useEffect(() => {
     const handleDown = (e: MouseEvent) => { 
         if (props.preventClose || previewAttachment || showVinDecode) return; 
         if (modalRef.current && !modalRef.current.contains(e.target as Node)) props.onClose(); 
@@ -1964,19 +1947,21 @@ function DetailModalWrapper(props: any) {
     <aside className={`w-full md:w-96 bg-[#F8FAFC] border-r border-slate-200 p-6 md:p-8 flex flex-col shrink-0 overflow-y-auto md:overflow-visible transition-all duration-300 ${!showInfoMobile ? 'hidden md:flex' : 'flex h-full'}`}>
       <div className="mb-6">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-[10px] font-black text-slate-500 tracking-[0.3em] uppercase">VEHICLE PROFILE</span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowInfoMobile(false)}
+              className="md:hidden p-1.5 text-slate-400 hover:text-slate-900"
+            >
+              <ArrowLeft size={16} />
+            </button>
+            <span className="text-[10px] font-black text-slate-500 tracking-[0.3em] uppercase">VEHICLE PROFILE</span>
+          </div>
           <div className="flex items-center gap-2">
             <button 
                 onClick={handleToggleModelEdit} 
                 className={`flex items-center justify-center p-2 rounded transition-all ${isEditingModel ? 'bg-slate-900 text-white' : 'bg-white text-slate-400 border border-slate-200 hover:bg-slate-50'}`}
             >
                 {isEditingModel ? <Check size={12} /> : <Pencil size={12} />}
-            </button>
-            <button 
-              onClick={() => setShowInfoMobile(false)} 
-              className="md:hidden p-2 text-slate-400 hover:text-slate-900"
-            >
-              <MessageSquare size={18} />
             </button>
           </div>
         </div>
@@ -2004,7 +1989,6 @@ function DetailModalWrapper(props: any) {
             {Object.entries(getStatusLabels(props.workType))
               .filter(([val]) => {
                 const s = val as ROStatus;
-                if (s === ROStatus.ARCHIVED) return false;
                 if (props.workType === 'MECHANIC') {
                   return [ROStatus.DONE, ROStatus.TODO, ROStatus.PENDING, ROStatus.IN_PROGRESS, ROStatus.BODY_WORK].includes(s);
                 } else {
@@ -2071,54 +2055,33 @@ function DetailModalWrapper(props: any) {
             phone={props.ro.phone} 
             onChange={(name: string, phone: string) => props.onUpdate({ customerName: name, phone })} 
           />
-          <DetailInfoEdit label="ORDER TOKEN" value={props.ro.id} onChange={(v: string) => props.onUpdate({ id: v })} />
-          <DetailInfoEdit label="VIN IDENTIFIER" value={props.ro.vin} onChange={(v: string) => props.onUpdate({ vin: v })} isVin onScan={props.onScan} />
-          
-          {/* Mileage and VIN Specs for Mobile */}
-          <div className="md:hidden space-y-3 pt-3">
-            <div className="bg-white p-4 rounded border border-slate-200 shadow-sm">
-              <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2">ODOMETER</p>
-              <div className="flex items-center gap-3">
-                <Navigation size={14} className="text-slate-400" />
-                <span className="text-sm font-black font-mono text-slate-900">
-                  {props.ro.mileage?.toLocaleString() || '0'} <span className="text-[10px] text-slate-400 ml-1 uppercase">KM</span>
-                </span>
-              </div>
+          <DetailInfoEdit label="ORDER NUMBER" value={props.ro.id} onChange={(v: string) => props.onUpdate({ id: v })} />
+          <DetailInfoEdit label="VIN" value={props.ro.vin} onChange={(v: string) => props.onUpdate({ vin: v })} isVin onScan={props.onScan} />
+          <div className="bg-blue-50/50 p-4 rounded border border-blue-100">
+            <p className="text-[9px] font-black text-blue-400 uppercase tracking-widest mb-2">VEHICLE SUMMARY</p>
+            <p className="text-[12px] font-black text-blue-900 tracking-tight">
+              {toVehicleSummary(props.ro.decodedData) || '-'}
+            </p>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                onClick={() => setShowVinDecode(true)}
+                className="px-3 py-1.5 rounded border border-blue-200 bg-white text-[9px] font-black text-blue-700 uppercase tracking-widest hover:bg-blue-50 transition-all disabled:bg-slate-50 disabled:text-slate-400 disabled:border-slate-200 disabled:cursor-not-allowed"
+                disabled={!props.ro.vin || props.ro.vin === 'CALENDAR_SYNC'}
+              >
+                {props.ro.vin && props.ro.vin !== 'CALENDAR_SYNC' ? 'VIN Decode / View Details' : '先填写 VIN'}
+              </button>
             </div>
-
-            {props.ro.decodedData && (
-              <div className="bg-blue-50/50 p-4 rounded border border-blue-100">
-                <p className="text-[9px] font-black text-blue-400 uppercase tracking-widest mb-3">VEHICLE SPECS</p>
-                <div className="grid grid-cols-2 gap-y-3 gap-x-4">
-                  {[
-                    { label: 'YEAR', value: props.ro.decodedData.year },
-                    { label: 'MAKE', value: props.ro.decodedData.make },
-                    { label: 'MODEL', value: props.ro.decodedData.model },
-                    { label: 'ENGINE', value: props.ro.decodedData.engine },
-                    { label: 'TRIM', value: props.ro.decodedData.trim },
-                    { label: 'DRIVETRAIN', value: props.ro.decodedData.drivetrain },
-                  ].filter(s => s.value).map((spec, i) => (
-                    <div key={i}>
-                      <p className="text-[8px] font-black text-blue-300 uppercase tracking-tighter">{spec.label}</p>
-                      <p className="text-[10px] font-black text-blue-900 truncate">{spec.value}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
-
-          {props.workType === 'BODY' && (
-            <div className="space-y-2">
-              <label className="text-[9px] font-black text-slate-400 tracking-[0.3em] uppercase">DELIVERY DATE</label>
-              <input 
-                type="date" 
-                value={props.ro.deliveryDate || ''} 
-                onChange={(e) => props.onUpdate({ deliveryDate: e.target.value })}
-                className="w-full bg-white border border-slate-200 rounded p-3 text-[11px] font-black text-slate-900 outline-none focus:border-blue-600"
-              />
-            </div>
-          )}
+          
+          <div className="space-y-2">
+            <label className="text-[9px] font-black text-slate-400 tracking-[0.3em] uppercase">DELIVERY DATE</label>
+            <input 
+              type="date" 
+              value={props.ro.deliveryDate || ''} 
+              onChange={(e) => props.onUpdate({ deliveryDate: e.target.value })}
+              className="w-full bg-white border border-slate-200 rounded p-3 text-[11px] font-black text-slate-900 outline-none focus:border-blue-600"
+            />
+          </div>
         </section>
 
         <section className="pt-6 border-t border-slate-200">
@@ -2164,6 +2127,12 @@ function DetailModalWrapper(props: any) {
               </h3>
             </div>
             <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 rounded bg-slate-50 text-slate-500 border border-slate-200 shadow-sm">
+                <Navigation size={14} />
+                <span className="text-[10px] font-black font-mono">
+                  {props.ro.mileage?.toLocaleString() || '0'} <span className="text-[9px] text-slate-400 ml-0.5">KM</span>
+                </span>
+              </div>
               <button 
                 onClick={props.onScan} 
                 className="flex items-center justify-center p-2 rounded bg-slate-50 text-slate-500 border border-slate-200 hover:bg-slate-100 hover:text-slate-900 transition-all shadow-sm"
@@ -2211,89 +2180,120 @@ function DetailModalWrapper(props: any) {
 function VinDecodeOverlay({ ro, onClose, onUpdate }: { ro: RepairOrder, onClose: () => void, onUpdate: (updates: any) => void }) {
   const [isDecoding, setIsDecoding] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showVehicleDetails, setShowVehicleDetails] = useState(true);
+  const [showRawData, setShowRawData] = useState(false);
 
-  const handleDecode = async () => {
-    if (!ro.vin || ro.vin === 'CALENDAR_SYNC') {
+  const handleDecode = async (vinInput?: string) => {
+    const targetVin = (vinInput || ro.vin || '').trim();
+    if (!targetVin || targetVin === 'CALENDAR_SYNC') {
       setError("Please provide a valid VIN first.");
       return;
+    }
+
+    if (vinInput && vinInput !== ro.vin) {
+      onUpdate({ vin: vinInput });
     }
 
     setIsDecoding(true);
     setError(null);
     try {
-      const decoded = await decodeVIN(ro.vin);
+      const decoded = await decodeVIN(targetVin);
       if (decoded) {
-        const decodedData = {
-          ...decoded,
-          decodedAt: new Date().toISOString()
+        const decodedData: RepairOrder['decodedData'] = {
+          ...(decoded as VinDecodedData),
+          decoded_data: decoded.decoded_data || {},
+          decodedAt: new Date().toISOString(),
         };
-        
-        // Update the RO with decoded data and potentially update the model name if it's generic
+
+        // Keep model name user-controlled; VIN decode only enriches decodedData.
         const updates: any = { decodedData };
-        if (decoded.year && decoded.make && decoded.model) {
-          updates.model = `${decoded.year} ${decoded.make} ${decoded.model}`;
-        }
-        
+
         onUpdate(updates);
       } else {
         setError("Could not decode this VIN. Please verify it is correct.");
       }
-    } catch (err) {
+    } catch {
       setError("An error occurred during decoding.");
     } finally {
       setIsDecoding(false);
     }
   };
 
-  // Automatically trigger decode if it hasn't been decoded yet and we have a VIN
   useEffect(() => {
     if (!ro.decodedData && ro.vin && ro.vin !== 'CALENDAR_SYNC' && !isDecoding && !error) {
       handleDecode();
     }
   }, [ro.vin]);
 
-  const specs = useMemo(() => {
-    if (ro.decodedData) {
-      return [
-        { label: 'YEAR', value: ro.decodedData.year },
-        { label: 'MAKE', value: ro.decodedData.make },
-        { label: 'MODEL', value: ro.decodedData.model },
-        { label: 'ENGINE', value: ro.decodedData.engine },
-        { label: 'TRIM', value: ro.decodedData.trim },
-        { label: 'TRANSMISSION', value: ro.decodedData.transmission },
-        { label: 'DRIVETRAIN', value: ro.decodedData.drivetrain },
-        { label: 'BODY STYLE', value: ro.decodedData.bodyStyle },
-        { label: 'PLANT', value: ro.decodedData.plant },
-      ].filter(s => s.value);
-    }
-    return [];
-  }, [ro.decodedData]);
+  const specs = useMemo(() => toDisplaySpecs(ro.decodedData), [ro.decodedData]);
+  const summary = useMemo(() => toVehicleSummary(ro.decodedData), [ro.decodedData]);
+  const rawData = (ro.decodedData?.decoded_data || {}) as Record<string, unknown>;
+
+  const structuredDetails = useMemo(() => {
+    const sections = [
+      {
+        title: 'IDENTITY',
+        items: [
+          { label: 'VIN', value: rawData.VIN },
+          { label: 'MANUFACTURER', value: rawData.Manufacturer },
+          { label: 'VEHICLE TYPE', value: rawData.VehicleType },
+          { label: 'BODY CLASS', value: rawData.BodyClass },
+        ],
+      },
+      {
+        title: 'POWERTRAIN',
+        items: [
+          { label: 'FUEL TYPE', value: rawData.FuelTypePrimary },
+          { label: 'ENGINE CYLINDERS', value: rawData.EngineCylinders },
+          { label: 'DISPLACEMENT (L)', value: rawData.DisplacementL },
+          { label: 'DRIVE TYPE', value: rawData.DriveType },
+          { label: 'TRANSMISSION', value: rawData.TransmissionStyle },
+        ],
+      },
+      {
+        title: 'PRODUCTION',
+        items: [
+          { label: 'MODEL YEAR', value: rawData.ModelYear },
+          { label: 'PLANT COMPANY', value: rawData.PlantCompanyName },
+          { label: 'PLANT CITY', value: rawData.PlantCity },
+          { label: 'PLANT COUNTRY', value: rawData.PlantCountry },
+        ],
+      },
+    ];
+
+    return sections
+      .map((section) => ({
+        ...section,
+        items: section.items.filter((item) => hasDisplayValue(item.value)),
+      }))
+      .filter((section) => section.items.length > 0);
+  }, [rawData]);
 
   return (
     <div className="fixed inset-0 z-[130] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-xl animate-in fade-in duration-200">
-      <div className="bg-white border border-slate-200 w-full max-w-xl rounded-none shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300">
-        <div className="p-8 border-b-8 border-blue-600">
+      <div className="bg-white border border-slate-200 w-full max-w-2xl rounded-none shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300">
+        <div className="p-8 border-b-8 border-blue-600 max-h-[88vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-8">
             <div className="flex items-center gap-3">
               <div className="p-2 bg-blue-600 text-white rounded shadow-lg">
                 <Cpu size={24} />
               </div>
-              <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tighter">OMNISCIENT DECODE</h2>
+              <h2 className="text-2xl font-black text-slate-900 uppercase tracking-tighter">VIN INTELLIGENCE DECODE</h2>
             </div>
             <button onClick={onClose} className="p-2 text-slate-300 hover:text-slate-900 transition-colors">
               <X size={24} />
             </button>
           </div>
-          
-          <div className="bg-slate-50 p-4 rounded border border-slate-100 mb-8 flex items-center justify-between">
-            <div>
-              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">RAW IDENTIFIER</p>
-              <p className="text-lg font-black font-mono text-slate-900 tracking-wider">{ro.vin}</p>
+
+          <div className="bg-slate-50 p-4 rounded border border-slate-100 mb-4 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">VIN</p>
+              <p className="text-lg font-black font-mono text-slate-900 tracking-wider truncate">{ro.vin}</p>
             </div>
-            <button 
-              onClick={handleDecode}
+            <button
+              onClick={() => handleDecode()}
               disabled={isDecoding}
-              className={`p-2 rounded border transition-all ${isDecoding ? 'bg-slate-100 text-slate-400' : 'bg-white text-blue-600 border-blue-200 hover:bg-blue-50'}`}
+              className={`p-2 rounded border transition-all shrink-0 ${isDecoding ? 'bg-slate-100 text-slate-400' : 'bg-white text-blue-600 border-blue-200 hover:bg-blue-50'}`}
               title="Re-decode"
             >
               <RefreshCcw size={18} className={isDecoding ? 'animate-spin' : ''} />
@@ -2301,7 +2301,7 @@ function VinDecodeOverlay({ ro, onClose, onUpdate }: { ro: RepairOrder, onClose:
           </div>
 
           {isDecoding ? (
-            <div className="py-20 flex flex-col items-center justify-center gap-4">
+            <div className="py-16 flex flex-col items-center justify-center gap-4">
               <RefreshCcw size={48} className="text-blue-600 animate-spin" />
               <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] animate-pulse">Analyzing VIN Structure...</p>
             </div>
@@ -2309,21 +2309,77 @@ function VinDecodeOverlay({ ro, onClose, onUpdate }: { ro: RepairOrder, onClose:
             <div className="py-12 text-center">
               <AlertTriangle size={48} className="text-amber-500 mx-auto mb-4" />
               <p className="text-sm font-black text-slate-900 uppercase tracking-tight mb-2">{error}</p>
-              <button 
-                onClick={handleDecode}
+              <button
+                onClick={() => handleDecode()}
                 className="text-[10px] font-black text-blue-600 uppercase tracking-widest hover:underline"
               >
                 Try Again
               </button>
             </div>
           ) : specs.length > 0 ? (
-            <div className="grid grid-cols-1 gap-4">
-              {specs.map((spec, i) => (
-                <div key={i} className="flex items-center justify-between py-3 border-b border-slate-100 last:border-0 group hover:bg-slate-50/50 px-2 transition-colors">
-                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{spec.label}</span>
-                  <span className="text-xs font-black text-slate-900 uppercase tracking-tight">{spec.value}</span>
+            <div className="space-y-6">
+              <div className="bg-blue-50 p-4 rounded border border-blue-100">
+                <p className="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-2">COMPACT VEHICLE SUMMARY</p>
+                <p className="text-sm font-black text-blue-900 uppercase tracking-tight">
+                  {summary || 'Decoded vehicle profile available'}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {specs.map((spec, i) => (
+                  <div key={i} className="flex items-center justify-between py-3 px-3 border border-slate-100 rounded bg-white">
+                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{spec.label}</span>
+                    <span className="text-xs font-black text-slate-900 uppercase tracking-tight ml-3 text-right">{String(spec.value)}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="pt-2">
+                <button
+                  onClick={() => setShowVehicleDetails((prev) => !prev)}
+                  className="px-3 py-2 rounded border border-slate-200 bg-white text-[10px] font-black text-slate-700 uppercase tracking-widest hover:border-blue-300 hover:text-blue-700 transition-all"
+                >
+                  {showVehicleDetails ? 'Hide Vehicle Details' : 'View Vehicle Details'}
+                </button>
+              </div>
+
+              {showVehicleDetails && (
+                <div className="space-y-4">
+                  {structuredDetails.length > 0 ? (
+                    structuredDetails.map((section) => (
+                      <div key={section.title} className="border border-slate-100 rounded p-4 bg-slate-50/50">
+                        <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-3">{section.title}</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {section.items.map((item) => (
+                            <div key={`${section.title}-${item.label}`} className="bg-white border border-slate-100 rounded px-3 py-2">
+                              <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest">{item.label}</p>
+                              <p className="text-[11px] font-black text-slate-900">{String(item.value)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="border border-slate-100 rounded p-4 bg-slate-50 text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                      No additional structured vehicle details available.
+                    </div>
+                  )}
                 </div>
-              ))}
+              )}
+
+              <div className="pt-2">
+                <button
+                  onClick={() => setShowRawData((prev) => !prev)}
+                  className="px-3 py-2 rounded border border-slate-200 bg-white text-[10px] font-black text-slate-700 uppercase tracking-widest hover:border-blue-300 hover:text-blue-700 transition-all"
+                >
+                  {showRawData ? 'Hide Raw VIN Data' : 'Show Raw VIN Data (Advanced)'}
+                </button>
+                {showRawData && (
+                  <pre className="mt-3 p-4 bg-slate-950 text-slate-200 rounded text-[10px] overflow-auto max-h-[240px] leading-relaxed">
+                    {JSON.stringify(rawData, null, 2)}
+                  </pre>
+                )}
+              </div>
             </div>
           ) : (
             <div className="py-12 text-center">
@@ -2335,7 +2391,7 @@ function VinDecodeOverlay({ ro, onClose, onUpdate }: { ro: RepairOrder, onClose:
           <div className="mt-10 pt-6 border-t border-slate-100 flex items-center justify-between">
             <div className="flex items-center gap-3 text-blue-600">
               <Zap size={14} />
-              <p className="text-[10px] font-black uppercase tracking-[0.2em]">INTELLIGENT HARDWARE SYNC COMPLETE</p>
+              <p className="text-[10px] font-black uppercase tracking-[0.2em]">VIN PROFILE SYNC COMPLETE</p>
             </div>
             {ro.decodedData?.decodedAt && (
               <p className="text-[8px] font-bold text-slate-400 uppercase">
@@ -2354,19 +2410,9 @@ function AttachmentSection({ attachments, onUpdate, onPreview }: { attachments: 
 
   const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const newFiles = Array.from(e.target.files).map((f: File) => {
-        const reader = new FileReader();
-        const id = Math.random().toString(36).substr(2, 9);
-        const name = f.name;
-        const type = f.type;
-        
-        return new Promise<Attachment>((resolve) => {
-          reader.onload = () => resolve({ id, name, type, data: reader.result as string });
-          reader.readAsDataURL(f);
-        });
-      });
+      const newFiles = Array.from(e.target.files).map((file) => buildLocalAttachment(file));
 
-      Promise.all(newFiles).then(resolvedFiles => {
+      Promise.all(newFiles).then((resolvedFiles) => {
         onUpdate([...attachments, ...resolvedFiles]);
       });
     }
@@ -2399,8 +2445,8 @@ function AttachmentSection({ attachments, onUpdate, onPreview }: { attachments: 
               <div className="p-2 bg-slate-50 rounded text-blue-600">
                 <FileText size={16} />
               </div>
-              <div className="min-w-0">
-                <p className="text-[11px] font-black text-slate-700 truncate uppercase tracking-wide">{a.name}</p>
+              <div className="min-w-0 flex-1 overflow-hidden">
+                <p className="text-[11px] font-black text-slate-700 uppercase tracking-wide break-words">{a.name}</p>
                 <p className="text-[9px] font-bold text-slate-400 uppercase mt-0.5">{a.type.split('/')[1] || 'DOC'}</p>
               </div>
             </div>
@@ -2448,7 +2494,7 @@ function CustomerInfoEdit({ name, phone, onChange }: { name: string, phone: stri
   return (
     <div className="bg-white p-4 rounded border border-slate-200 shadow-sm group hover:border-slate-300 transition-all">
       <div className="flex justify-between items-start mb-2">
-        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">CUSTOMER DATA</p>
+        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">CUSTOMER INFO</p>
         <button 
           onClick={handleToggle} 
           className={`flex items-center justify-center p-1.5 rounded transition-all ${isEditing ? 'bg-slate-900 text-white' : 'text-slate-400 hover:text-slate-600'}`}
@@ -2668,6 +2714,7 @@ function ModalTabs({ ro, userRole, onAddLog, onAddAiLog, onUpdate, onShowVinDeco
   const [isAiLoading, setIsAiLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const foremanQuickPhrases = ['Oil leak detected', 'Coolant leak detected', 'Brake pads worn'];
   
   const [isEditingMileage, setIsEditingMileage] = useState(false);
   const [localMileage, setLocalMileage] = useState(ro.mileage?.toString() || '0');
@@ -2702,8 +2749,10 @@ function ModalTabs({ ro, userRole, onAddLog, onAddAiLog, onUpdate, onShowVinDeco
         })),
         attachments: (ro.attachments || []).map((a: Attachment) => ({
           name: a.name,
-          data: a.data,
-          type: a.type
+          type: a.type,
+          url: a.url,
+          storageKey: a.storageKey,
+          previewUrl: a.previewUrl,
         })),
         userMessage: text
       };
@@ -2781,13 +2830,6 @@ function ModalTabs({ ro, userRole, onAddLog, onAddAiLog, onUpdate, onShowVinDeco
               </span>
             )}
           </div>
-          
-          <button 
-            onClick={onShowVinDecode}
-            className="p-2.5 bg-blue-50 text-blue-600 rounded-lg border border-blue-100 hover:bg-blue-600 hover:text-white transition-all shadow-sm"
-          >
-            <Car size={20} strokeWidth={2.5} />
-          </button>
         </div>
       </div>
 
@@ -2821,37 +2863,132 @@ function ModalTabs({ ro, userRole, onAddLog, onAddAiLog, onUpdate, onShowVinDeco
           </div> 
         )}
       </div>
-      <div className="p-4 md:p-6 bg-slate-50 border-t border-slate-200 flex items-center gap-3 md:gap-4 shrink-0">
-        <div className="shrink-0">
-          <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
-          <button onClick={() => fileInputRef.current?.click()} className="p-3 text-slate-500 hover:text-slate-900 transition-all bg-white border border-slate-200 rounded hover:border-slate-400 shadow-sm">
-            <ImageIcon size={20} />
+      <div className="p-4 md:p-6 bg-slate-50 border-t border-slate-200 shrink-0">
+        {tab === 'UPDATES' && userRole === 'FOREMAN' && (
+          <div className="mb-3 md:mb-4 flex flex-wrap gap-2">
+            {foremanQuickPhrases.map((phrase) => (
+              <button
+                key={phrase}
+                onClick={() => onAddLog(phrase, 'USER')}
+                className="px-3 py-1.5 rounded border border-slate-200 bg-white text-[9px] font-black text-slate-700 uppercase tracking-widest hover:border-blue-300 hover:text-blue-700 transition-all"
+              >
+                {phrase}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="flex items-center gap-3 md:gap-4">
+          <div className="shrink-0">
+            <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
+            <button onClick={() => fileInputRef.current?.click()} className="p-3 text-slate-500 hover:text-slate-900 transition-all bg-white border border-slate-200 rounded hover:border-slate-400 shadow-sm">
+              <ImageIcon size={20} />
+            </button>
+          </div>
+          <div className="flex-1 flex items-center">
+            <textarea 
+              placeholder={tab === 'AI' ? "ASK AI..." : "LOG UPDATE..."} 
+              className="w-full bg-white border border-slate-200 rounded px-3 md:px-4 py-3.5 md:py-5 outline-none focus:border-blue-600 text-[11px] font-black text-slate-900 tracking-wide h-12 md:h-16 custom-scrollbar resize-none shadow-inner leading-tight" 
+              value={input} 
+              onChange={(e) => setInput(e.target.value)} 
+              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())} 
+            />
+          </div>
+          <button onClick={handleSend} className="bg-slate-900 text-white p-3 md:p-4 rounded shadow-md border-b-4 border-slate-700 active:border-b-0 hover:bg-slate-800">
+            <ChevronRight size={24} />
           </button>
         </div>
-        <div className="flex-1 flex items-center">
-          <textarea 
-            placeholder={tab === 'AI' ? "ASK AI..." : "LOG UPDATE..."} 
-            className="w-full bg-white border border-slate-200 rounded px-3 md:px-4 py-3.5 md:py-5 outline-none focus:border-blue-600 text-[11px] font-black text-slate-900 tracking-wide h-12 md:h-16 custom-scrollbar resize-none shadow-inner leading-tight" 
-            value={input} 
-            onChange={(e) => setInput(e.target.value)} 
-            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())} 
-          />
-        </div>
-        <button onClick={handleSend} className="bg-slate-900 text-white p-3 md:p-4 rounded shadow-md border-b-4 border-slate-700 active:border-b-0 hover:bg-slate-800">
-          <ChevronRight size={24} />
-        </button>
       </div>
     </div>
   );
 }
 
-function VINScanner({ onClose, onScan }: { onClose: () => void, onScan: (vin: string) => void }) {
+function VINScanner({ onBack, onScan }: { onBack: () => void, onScan: (result: { vin?: string; attachment?: Attachment }) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
-  useEffect(() => { 
-    async function startCamera() { try { const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); setStream(s); if (videoRef.current) videoRef.current.srcObject = s; } catch (e) { alert("Camera access required."); onClose(); } } 
-    startCamera(); return () => stream?.getTracks().forEach(t => t.stop()); 
+  const streamRef = useRef<MediaStream | null>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+    async function startCamera() {
+      try {
+        const mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        if (!isMounted) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        streamRef.current = mediaStream;
+        if (videoRef.current) videoRef.current.srcObject = mediaStream;
+      } catch (e) {
+        alert("Camera access required.");
+        onBack();
+      }
+    }
+    startCamera();
+    return () => {
+      isMounted = false;
+      stopCamera();
+    };
   }, []);
+
+  const handleBack = () => {
+    stopCamera();
+    onBack();
+  };
+
+  const handleCapture = async () => {
+    if (isCapturing) return;
+    const video = videoRef.current;
+    let attachment: Attachment | undefined;
+    setError(null);
+    setIsCapturing(true);
+
+    if (video && video.videoWidth > 0 && video.videoHeight > 0) {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      if (context) {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        attachment = {
+          id: `vin-scan-${Date.now()}`,
+          name: `vin-scan-${new Date().toISOString()}.jpg`,
+          type: 'image/jpeg',
+          previewUrl: canvas.toDataURL('image/jpeg', 0.92),
+        };
+      }
+    }
+
+    if (!attachment?.previewUrl) {
+      setError('Camera frame was not ready. Hold steady and try again.');
+      setIsCapturing(false);
+      return;
+    }
+
+    try {
+      let vin: string | undefined;
+      const result = await scanVinFromImage(attachment.previewUrl);
+      vin = result?.vin;
+      stopCamera();
+      onScan({ vin, attachment });
+    } catch (captureError) {
+      console.error('VIN scan failed:', captureError);
+      setError('Could not read VIN from the image. You can retake it or enter VIN manually.');
+    } finally {
+      setIsCapturing(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-[110] flex flex-col items-center justify-center bg-slate-900/95 backdrop-blur-xl">
       <div className="relative w-full max-4xl aspect-video rounded border-4 border-slate-700 overflow-hidden bg-black shadow-2xl">
@@ -2861,9 +2998,16 @@ function VINScanner({ onClose, onScan }: { onClose: () => void, onScan: (vin: st
           <div className="absolute inset-10 border-2 border-dashed border-white/10" />
         </div>
       </div>
+      {error && (
+        <div className="mt-4 rounded border border-red-500/40 bg-red-500/10 px-4 py-3 text-[10px] font-black uppercase tracking-[0.2em] text-red-200">
+          {error}
+        </div>
+      )}
       <div className="mt-12 flex gap-6"> 
-        <button onClick={onClose} className="px-12 py-4 bg-white text-slate-600 rounded font-black uppercase text-xs tracking-widest border border-slate-300 shadow-sm">ABORT</button> 
-        <button onClick={() => onScan("WBS" + Math.random().toString(36).substr(2, 14).toUpperCase())} className="px-12 py-4 bg-blue-600 text-white rounded font-black uppercase text-xs tracking-widest shadow-xl border-b-4 border-blue-800 active:border-b-0">CAPTURE VIN</button> 
+        <button onClick={handleBack} disabled={isCapturing} className="px-12 py-4 bg-white text-slate-600 rounded font-black uppercase text-xs tracking-widest border border-slate-300 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed">BACK</button> 
+        <button onClick={handleCapture} disabled={isCapturing} className="px-12 py-4 bg-blue-600 text-white rounded font-black uppercase text-xs tracking-widest shadow-xl border-b-4 border-blue-800 active:border-b-0 disabled:opacity-50 disabled:cursor-not-allowed">
+          {isCapturing ? 'READING VIN...' : 'CAPTURE VIN'}
+        </button> 
       </div>
     </div>
   );
@@ -2897,13 +3041,7 @@ function NewRODialog({ onClose, onSubmit }: { onClose: () => void, onSubmit: (da
     // Default status for all new orders is TODO
     const initialStatus = ROStatus.TODO;
 
-    const attachmentsPromise = uploadedFiles.map(f => {
-      const reader = new FileReader();
-      return new Promise<Attachment>((resolve) => {
-        reader.onload = () => resolve({ id: Math.random().toString(36).substr(2, 9), name: f.name, type: f.type, data: reader.result as string });
-        reader.readAsDataURL(f);
-      });
-    });
+    const attachmentsPromise = uploadedFiles.map((file) => buildLocalAttachment(file));
 
     Promise.all(attachmentsPromise).then(attachments => {
       onSubmit({ 
@@ -2963,17 +3101,16 @@ function NewRODialog({ onClose, onSubmit }: { onClose: () => void, onSubmit: (da
               <BulletPointInput ref={infoRef} value={formData.info} lastReadValue="" onChange={(val: string) => setFormData({...formData, info: val})} defaultEditing={true} hideToggle={true}/>
             </div>
 
-            {orderType === 'BODY' && (
-              <div className="space-y-2">
-                <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest">DELIVERY DATE</label>
-                <input 
-                  type="date" 
-                  className="w-full bg-slate-50 border border-slate-200 rounded p-3 md:p-4 text-xs font-black text-slate-900 outline-none focus:border-blue-600 tracking-wider transition-all" 
-                  value={formData.deliveryDate} 
-                  onChange={(e) => setFormData({...formData, deliveryDate: e.target.value})}
-                />
-              </div>
-            )}
+            <div className="space-y-2">
+              <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest">DELIVERY DATE</label>
+              <input 
+                type="date" 
+              className="w-full bg-slate-50 border border-slate-200 rounded p-3 md:p-4 text-xs font-black text-slate-900 outline-none focus:border-blue-600 tracking-wider transition-all"
+              placeholder="Select delivery date (optional)"
+              value={formData.deliveryDate || ''} 
+                onChange={(e) => setFormData({...formData, deliveryDate: e.target.value})}
+              />
+            </div>
 
             <div className="space-y-2 border-t border-slate-100 pt-6 mt-6">
               <label className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest">ATTACHMENTS</label>
@@ -2985,8 +3122,8 @@ function NewRODialog({ onClose, onSubmit }: { onClose: () => void, onSubmit: (da
               {uploadedFiles.length > 0 && (
                 <div className="mt-4 flex flex-wrap gap-2">
                   {uploadedFiles.map((file, i) => (
-                    <div key={i} className="flex items-center gap-2 bg-blue-50 border border-blue-200 px-3 py-1 rounded text-[8px] md:text-[9px] font-black text-blue-700 uppercase">
-                      <FileText size={10} className="md:w-3 md:h-3" /> {file.name}
+                    <div key={i} className="flex items-center gap-2 bg-blue-50 border border-blue-200 px-3 py-1 rounded text-[8px] md:text-[9px] font-black text-blue-700 uppercase min-w-0 max-w-full">
+                      <FileText size={10} className="md:w-3 md:h-3 shrink-0" /> <span className="break-words min-w-0">{file.name}</span>
                       <button onClick={(e) => { e.stopPropagation(); setUploadedFiles(prev => prev.filter((_, idx) => idx !== i)); }} className="hover:text-red-600 transition-colors"><Trash2 size={10} className="md:w-3 md:h-3" /></button>
                     </div>
                   ))}
@@ -2996,7 +3133,7 @@ function NewRODialog({ onClose, onSubmit }: { onClose: () => void, onSubmit: (da
           </div>
           <div className="flex gap-4 md:gap-6 mt-8 md:mt-12 pt-6 border-t border-slate-100">
             <button onClick={onClose} className="flex-1 py-3 md:py-4 bg-slate-100 text-slate-500 rounded font-black uppercase text-[10px] md:text-[11px] tracking-widest border border-slate-200 hover:bg-slate-200 transition-all">CANCEL</button>
-            <button onClick={handleInitiate} className={`flex-[2] py-3 md:py-4 rounded font-black uppercase text-[10px] md:text-[11px] tracking-widest shadow-xl border-b-4 active:border-b-0 transition-all ${orderType === 'MECHANIC' ? 'bg-slate-900 border-slate-700 hover:bg-slate-800 text-white' : 'bg-[#6B4C7A] border-[#4A3256] hover:bg-[#583E65] text-white'}`}>{orderType === 'MECHANIC' ? 'INITIATE MECHANIC RO' : 'START BODY WORK'}</button>
+            <button onClick={handleInitiate} className={`flex-[2] py-3 md:py-4 rounded font-black uppercase text-[10px] md:text-[11px] tracking-widest shadow-xl border-b-4 active:border-b-0 transition-all ${orderType === 'MECHANIC' ? 'bg-slate-900 border-slate-700 hover:bg-slate-800 text-white' : 'bg-[#6B4C7A] border-[#4A3256] hover:bg-[#583E65] text-white'}`}>{orderType === 'MECHANIC' ? 'INITIATE MECHANIC RO' : 'START Bodywork'}</button>
           </div>
         </div>
       </div>
@@ -3027,7 +3164,7 @@ function AllRepairOrdersView({
   
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return ros.filter(ro => ro.status !== ROStatus.ARCHIVED && (
+    return ros.filter(ro => !isRepairOrderArchived(ro) && (
       ro.model.toLowerCase().includes(q) ||
       ro.customerName.toLowerCase().includes(q) ||
       ro.vin.toLowerCase().includes(q) ||
@@ -3102,7 +3239,7 @@ function AllRepairOrdersView({
       <div className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar">
         <div className="max-w-[1800px] mx-auto">
           {/* Single grid for both Body Shop and Mechanic Shop: no section headers or dividers, just cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 2xl:grid-cols-10 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4">
             {currentSectionOrder.flatMap(status => grouped[status] || []).map(ro => (
               <KanbanCard 
                 key={ro.id} 
@@ -3133,6 +3270,7 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
   const [searchHistory, setSearchHistory] = useState('');
   const [insuranceFilter, setInsuranceFilter] = useState<'ALL' | 'ONLY' | 'NONE'>('ALL');
   const [methods, setMethods] = useState<Set<string>>(new Set(['CASH', 'CHEQUE', 'ABANDONED']));
+  const [showMobileSettlement, setShowMobileSettlement] = useState(false);
   
   const toggleMethod = (m: string) => {
     const next = new Set(methods);
@@ -3143,7 +3281,7 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
   const filtered = useMemo(() => {
     const q = searchHistory.toLowerCase().trim();
     const qRaw = q.replace(/\D/g, '');
-    return ros.filter((ro: any) => {
+    const rows = ros.filter((ro: any) => {
       const matchMethod = methods.has(ro.paymentMethod || '');
       
       let matchInsurance = true;
@@ -3162,6 +3300,11 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
         matchSearch = ((qRaw && phoneRaw.includes(qRaw)) || ro.customerName.toLowerCase().includes(q) || ro.model.toLowerCase().includes(q) || ro.id.toLowerCase().includes(q) || ro.vin.toLowerCase().includes(q));
       }
       return matchMethod && matchDate && matchSearch && matchInsurance;
+    });
+    return rows.sort((a: any, b: any) => {
+      const aTime = new Date(a.settledAt || 0).getTime();
+      const bTime = new Date(b.settledAt || 0).getTime();
+      return bTime - aTime;
     });
   }, [ros, methods, startDate, endDate, searchHistory, insuranceFilter]);
 
@@ -3182,7 +3325,7 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div className="flex items-center gap-3 md:gap-5">
                 <div className="text-slate-900 p-2 md:p-3 bg-slate-100 rounded border border-slate-200"><History className="w-6 h-6 md:w-8 md:h-8" /></div>
-                <h2 className="text-xl md:text-3xl font-black text-slate-900 uppercase tracking-tighter">ARCHIVES</h2>
+                <h2 className="text-xl md:text-3xl font-black text-slate-900 uppercase tracking-tighter">HISTORY</h2>
             </div>
             <div className="relative group">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-600 transition-colors" size={16} />
@@ -3222,7 +3365,7 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
         </div>
       </div>
       <div className="flex-1 flex flex-col md:flex-row gap-6 md:gap-10 p-4 md:p-10 overflow-hidden max-w-[1800px] mx-auto w-full">
-        <div className="flex-1 overflow-y-auto custom-scrollbar pr-0 md:pr-4 space-y-3">
+        <div className="flex-1 overflow-y-auto custom-scrollbar pr-0 md:pr-4 space-y-3 pb-20 md:pb-0">
           {filtered.length > 0 ? filtered.map((ro: any) => (
             <div key={ro.id} onClick={() => onView(ro.id)} className="bg-white px-4 md:px-8 py-4 md:py-5 rounded border border-[#E5E7EB] hover:border-blue-600 transition-all cursor-pointer flex items-center gap-4 md:gap-8 group shadow-sm">
                 <div className={`w-10 h-10 md:w-12 md:h-12 rounded flex items-center justify-center shrink-0 border-2 ${ro.paymentMethod === 'ABANDONED' ? 'border-red-100 bg-red-50 text-red-600' : 'border-emerald-100 bg-emerald-50 text-emerald-600'}`}>{ro.paymentMethod === 'CASH' ? <Coins size={12} /> : ro.paymentMethod === 'CHEQUE' ? <Banknote size={12} /> : <Ban size={12} />}</div>
@@ -3231,20 +3374,34 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
                     <h3 className={`text-[12px] md:text-[14px] font-black truncate tracking-tight ${ro.urgent ? 'text-red-700' : 'text-slate-900'}`}>{ro.model}</h3>
                     {ro.isInsuranceCase && <Shield size={12} className="text-[#6B4C7A]" />}
                   </div>
-                  <div className="flex items-center gap-2 md:gap-3 mt-1"><p className="text-[8px] md:text-[9px] font-black text-slate-400 uppercase tracking-widest">{ro.id}</p><div className="w-1 h-1 rounded-full bg-slate-200" /><p className="text-[8px] md:text-[9px] font-black text-blue-700 uppercase tracking-widest">{ro.customerName}</p></div>
+                  <div className="flex items-center gap-2 md:gap-3 mt-1">
+                    <p className="text-[8px] md:text-[9px] font-black text-slate-400 uppercase tracking-widest">{ro.id}</p>
+                  </div>
+                  {ro.settledAt && (
+                    <div className="flex items-center gap-1.5 mt-1 text-[8px] md:text-[9px] font-bold text-slate-500">
+                      <Clock size={10} className="shrink-0 text-slate-400" />
+                      {new Date(ro.settledAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}
+                    </div>
+                  )}
                 </div>
-                <div className="flex-1 min-w-0 hidden md:block"><div className="flex flex-col gap-1 overflow-hidden opacity-60">{ro.info.split('\n').filter(Boolean).slice(0, 2).map((line: string, idx: number) => (<div key={idx} className="flex items-center gap-2 text-[9px] font-bold text-slate-500 truncate uppercase tracking-wide"><span className="w-1 h-1 rounded-full shrink-0 bg-slate-400" aria-hidden /><span className="min-w-0 truncate">{line}</span></div>))}</div></div>
+                <div className="flex-1 min-w-0 hidden md:block">
+                  <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">SUMMARY</p>
+                  <p className="text-[10px] font-bold text-slate-600 leading-relaxed line-clamp-2">
+                    {ro.aiSummary?.trim() || ro.summary?.trim() || ro.historySummary?.trim() || 'Summary will be generated from Event Log.'}
+                  </p>
+                </div>
                 <div className="flex-1 text-right shrink-0"><p className={`text-sm md:text-lg font-black font-mono tracking-tighter ${ro.paymentMethod === 'ABANDONED' ? 'text-red-400 opacity-60' : 'text-emerald-700'}`}>{ro.paymentMethod === 'ABANDONED' ? 'VOID' : `$${ro.paymentAmount?.toFixed(2)}`}</p><p className="text-[7px] md:text-[8px] font-black text-slate-400 uppercase tracking-[0.2em] mt-0.5">{ro.paymentMethod}</p></div>
                 {ro.paymentMethod === 'ABANDONED' && (<button onClick={(e) => { e.stopPropagation(); onRestore(ro.id); }} className="p-2 md:p-3 bg-slate-50 text-blue-600 rounded border border-slate-200 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition-all shadow-sm"><RotateCcw className="w-3.5 h-3.5 md:w-4 md:h-4" /></button>)}
             </div>
           )) : (
             <div className="h-full flex flex-col items-center justify-center text-slate-200 uppercase font-black text-xl md:text-2xl tracking-[0.4em] md:tracking-[0.8em] text-center p-8"><Filter className="w-20 h-20 md:w-[120px] md:h-[120px] mb-6 md:mb-8 opacity-20" />NO MATCHING RECORDS</div>
           )}
+
         </div>
-        <aside className="w-full md:w-[400px] flex flex-col gap-6">
+        <aside className="hidden md:flex w-full md:w-[400px] flex-col gap-6">
             <div className="bg-white p-6 md:p-8 rounded border-2 border-slate-900 shadow-xl flex flex-col gap-6 md:gap-8 relative overflow-hidden group">
                 <div className="absolute top-0 right-0 p-4 md:p-6 opacity-5 group-hover:opacity-10 transition-opacity"><DollarSign className="w-[60px] h-[60px] md:w-[100px] md:h-[100px]" /></div>
-                <div><span className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-[0.4em]">GROSS SETTLEMENT</span><h4 className="text-3xl md:text-5xl font-black text-slate-900 mt-2 md:mt-4 tracking-tighter font-mono">${stats.totalRev.toFixed(2)}</h4></div>
+                <div><span className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-[0.4em]">Revenue Summary</span><h4 className="text-3xl md:text-5xl font-black text-slate-900 mt-2 md:mt-4 tracking-tighter font-mono">${stats.totalRev.toFixed(2)}</h4></div>
                 <div className="space-y-4 md:space-y-6 pt-6 md:pt-8 border-t border-slate-100">
                     <div className="flex justify-between items-center"><span className="text-[9px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Coins size={12}/> CASH</span><span className="text-xs md:text-sm font-black text-slate-700 font-mono">${stats.cashSum.toFixed(2)}</span></div>
                     <div className="flex justify-between items-center"><span className="text-[9px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Banknote size={12}/> CHEQUE</span><span className="text-xs md:text-sm font-black text-slate-700 font-mono">${stats.chequeSum.toFixed(2)}</span></div>
@@ -3254,6 +3411,42 @@ function OrderHistoryView({ workType, ros, onRestore, onView }: any) {
             </div>
         </aside>
       </div>
+
+      <div className="md:hidden fixed bottom-3 left-1/2 -translate-x-1/2 z-40 w-[calc(100%-1.5rem)] max-w-md">
+        <button
+          onClick={() => setShowMobileSettlement(prev => !prev)}
+          className="w-full flex items-center justify-center gap-2 bg-slate-900 text-white border border-slate-900 rounded-full px-4 py-2.5 shadow-lg"
+        >
+          <span className="text-[9px] font-black uppercase tracking-widest">Revenue Summary</span>
+          {showMobileSettlement ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+        </button>
+      </div>
+
+      {showMobileSettlement && (
+        <div className="md:hidden fixed inset-0 z-50 flex items-end">
+          <button
+            aria-label="Close settlement panel"
+            className="absolute inset-0 bg-slate-900/35"
+            onClick={() => setShowMobileSettlement(false)}
+          />
+          <div className="relative w-full bg-white rounded-t-2xl border-t border-slate-200 shadow-2xl p-5 pb-7 animate-in slide-in-from-bottom-5 duration-200">
+            <div className="w-10 h-1 bg-slate-200 rounded-full mx-auto mb-4" />
+            <div>
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-[0.3em]">Revenue Summary</span>
+              <h4 className="text-3xl font-black text-slate-900 mt-2 tracking-tighter font-mono">${stats.totalRev.toFixed(2)}</h4>
+            </div>
+            <div className="space-y-2 pt-4 mt-4 border-t border-slate-100">
+              <div className="flex justify-between items-center"><span className="text-[9px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Coins size={12}/> CASH</span><span className="text-xs font-black text-slate-700 font-mono">${stats.cashSum.toFixed(2)}</span></div>
+              <div className="flex justify-between items-center"><span className="text-[9px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><Banknote size={12}/> CHEQUE</span><span className="text-xs font-black text-slate-700 font-mono">${stats.chequeSum.toFixed(2)}</span></div>
+              <div className="flex justify-between items-center pt-1"><span className="text-[9px] font-black text-red-700 uppercase tracking-widest">VOIDED</span><span className="text-xs font-black text-red-600 font-mono">{stats.noRepairCount} UNITS</span></div>
+            </div>
+            <div className="bg-slate-50 p-3 rounded border border-slate-200 text-center mt-4">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-[0.3em]">Total Records</span>
+              <p className="text-base font-black text-slate-900 mt-1 tracking-widest">{stats.count}</p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -3262,12 +3455,12 @@ function PaymentDialog({ roId, onClose, onSettle }: any) {
   const [amount, setAmount] = useState('0.00');
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-2xl p-4 md:p-6 animate-in fade-in duration-300">
-      <div className="bg-white border border-slate-200 w-full max-lg rounded-xl p-8 md:p-12 shadow-2xl animate-in zoom-in duration-400">
-        <h3 className="text-2xl md:text-3xl font-black text-slate-900 uppercase mb-3 md:mb-4 text-center tracking-tighter">SETTLE TOKEN</h3>
-        <p className="text-[9px] md:text-[11px] font-black text-slate-400 uppercase tracking-[0.3em] md:tracking-[0.5em] mb-8 md:mb-12 text-center">ORDER ID: #{roId}</p>
-        <div className="mb-8 md:mb-12"><label className="text-[9px] md:text-[10px] font-black text-blue-600 uppercase tracking-[0.3em] mb-3 md:mb-4 block px-2 text-center md:text-left">GROSS AMOUNT ($)</label><input type="number" className="w-full text-4xl md:text-7xl font-black bg-slate-50 border border-slate-200 rounded p-6 md:p-10 text-slate-900 text-center shadow-inner focus:border-blue-600 outline-none font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} /></div>
-        <div className="space-y-3 md:space-y-4"><button onClick={() => onSettle('CASH', parseFloat(amount) || 0)} className="w-full py-4 md:py-6 bg-emerald-600 text-white rounded font-black text-xs md:text-sm uppercase tracking-[0.2em] md:tracking-[0.3em] shadow-lg border-b-4 border-emerald-800 active:border-b-0 hover:bg-emerald-700 transition-all">SETTLE AS CASH</button><button onClick={() => onSettle('CHEQUE', parseFloat(amount) || 0)} className="w-full py-4 md:py-6 bg-slate-900 text-white rounded font-black text-xs md:text-sm uppercase tracking-[0.2em] md:tracking-[0.3em] shadow-lg border-b-4 border-slate-700 active:border-b-0 hover:bg-slate-800 transition-all">SETTLE AS CHEQUE</button></div>
-        <button onClick={onClose} className="mt-8 md:mt-10 w-full py-3 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] md:tracking-[0.5em] hover:text-slate-900 transition-colors">RETURN TO REPAIR</button>
+      <div className="bg-white border border-slate-200 w-full max-w-md rounded-xl p-6 shadow-2xl animate-in zoom-in duration-400">
+        <h3 className="text-xl font-black text-slate-900 uppercase mb-2 text-center tracking-tighter">FINALIZE & COLLECT</h3>
+        <p className="text-[9px] font-black text-slate-400 uppercase tracking-[0.3em] mb-6 text-center">ORDER ID: #{roId}</p>
+        <div className="mb-6"><label className="text-[9px] font-black text-blue-600 uppercase tracking-[0.3em] mb-2 block text-left">GROSS AMOUNT ($)</label><input type="number" className="w-full text-3xl font-black bg-slate-50 border border-slate-200 rounded p-4 text-slate-900 text-center shadow-inner focus:border-blue-600 outline-none font-mono" value={amount} onChange={(e) => setAmount(e.target.value)} /></div>
+        <div className="space-y-3"><button onClick={() => onSettle('CASH', parseFloat(amount) || 0)} className="w-full py-3 bg-emerald-600 text-white rounded font-black text-xs uppercase tracking-[0.2em] shadow-lg border-b-4 border-emerald-800 active:border-b-0 hover:bg-emerald-700 transition-all">SETTLE AS CASH</button><button onClick={() => onSettle('CHEQUE', parseFloat(amount) || 0)} className="w-full py-3 bg-slate-900 text-white rounded font-black text-xs uppercase tracking-[0.2em] shadow-lg border-b-4 border-slate-700 active:border-b-0 hover:bg-slate-800 transition-all">SETTLE AS CHEQUE</button></div>
+        <button onClick={onClose} className="mt-6 w-full py-2 text-[9px] font-black text-slate-400 uppercase tracking-[0.3em] hover:text-slate-900 transition-colors">RETURN TO REPAIR</button>
       </div>
     </div>
   );
